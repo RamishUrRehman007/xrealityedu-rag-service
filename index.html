@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>WebSocket Test with Room ID</title>
+  <style>
+    body { font-family: Arial; padding: 20px; }
+    #log { white-space: pre-wrap; background: #f0f0f0; padding: 10px; height: 250px; overflow-y: scroll; }
+    input, button { margin: 5px 0; }
+  </style>
+</head>
+<body>
+
+  <h2>🧪 AI Tutor - WebSocket Tester</h2>
+
+  <label>Room ID:</label><br />
+  <input id="roomInput" type="text" style="width: 300px;" placeholder="e.g. grade6_physics_student1" />
+  <button onclick="connectSocket()">Connect</button>
+
+  <br /><br />
+  <label>Message to AI:</label><br />
+  <input id="msgInput" type="text" style="width: 400px;" placeholder="Type your question..." />
+  <button onclick="sendMessage()">Send</button>
+
+  <h3>💬 Chat Log:</h3>
+  <div id="log"></div>
+
+  <script>
+    let socket = null;
+
+    const log = (text) => {
+      const logBox = document.getElementById("log");
+      logBox.textContent += text + "\n";
+      logBox.scrollTop = logBox.scrollHeight;
+    };
+
+    function connectSocket() {
+      const roomId = document.getElementById("roomInput").value.trim();
+      if (!roomId) return alert("Please enter a room ID");
+
+      socket = new WebSocket(`wss://ai.xrealityedu.com/ws/qa_chat/${roomId}`);
+
+      socket.onopen = () => log(`✅ Connected to room: ${roomId}`);
+      socket.onerror = () => log("❌ WebSocket connection error");
+      socket.onclose = () => log("🔌 Connection closed");
+
+      socket.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        log(`🤖 AI: ${data.message}`);
+      };
+    }
+
+    function sendMessage() {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        return alert("Socket not connected. Connect to a room first.");
+      }
+
+      const input = document.getElementById("msgInput");
+      const message = input.value.trim();
+      if (!message) return;
+
+      const payload = {
+        user_id: "student123",
+        message: message
+      };
+
+      log(`🧑 You: ${message}`);
+      socket.send(JSON.stringify(payload));
+      input.value = "";
+    }
+  </script>
+
+</body>
+</html>
