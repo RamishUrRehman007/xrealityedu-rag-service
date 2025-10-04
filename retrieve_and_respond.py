@@ -2,8 +2,7 @@ import os
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
-from langchain_core.prompts import PromptTemplate
-from langchain.chains.retrieval import create_retrieval_chain
+from langchain.prompts import PromptTemplate
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -20,7 +19,10 @@ Start by introducing yourself and asking:
 
 After that, begin teaching.
 
-Context:
+Context from knowledge base:
+{context}
+
+Previous conversation:
 {history}
 
 Student said:
@@ -41,7 +43,10 @@ If they seem confused or unsure:
 
 End every few responses by asking if the student wants to try a short quiz.
 
-Context:
+Context from knowledge base:
+{context}
+
+Previous conversation:
 {history}
 
 Student said:
@@ -58,7 +63,10 @@ Create a 1-question multiple choice quiz about this topic. Only provide:
 - 4 options labeled A, B, C, and D
 - Ask student to pick one option
 
-Context:
+Context from knowledge base:
+{context}
+
+Previous conversation:
 {history}
 
 Student said:
@@ -102,23 +110,28 @@ def answer_question(question: str, history: str, subject: str, student_name: str
 
     if docs_found:
         try:
-            retrieval_chain = create_retrieval_chain(retriever, chain)
-            result = retrieval_chain.invoke({
+            # Use the retrieved documents directly with the chain
+            retrieved_docs = retriever.invoke(question)
+            context = "\n".join([doc.page_content for doc in retrieved_docs])
+            result = chain.invoke({
                 "input": question,
-                "history": history
+                "history": history,
+                "context": context
             })
-            answer = result["answer"]
+            answer = result
         except Exception as e:
             print(f"Retrieval chain error: {e}")
             result = chain.invoke({
                 "input": question,
-                "history": history
+                "history": history,
+                "context": ""
             })
             answer = result
     else:
         result = chain.invoke({
             "input": question,
-            "history": history
+            "history": history,
+            "context": ""
         })
         answer = result
 
@@ -213,3 +226,93 @@ def get_user_chat_history(student_id: str, subject: str):
         }
     )
     return retriever.invoke(f"past interactions in {subject}")
+
+def generate_prompt_suggestions(question: str, response: str, subject: str, student_name: str, grade_level: str, history: str = "") -> list:
+    """
+    Generate 3 contextual prompt suggestions based on the current conversation
+    """
+    try:
+        # Create a prompt for generating follow-up questions
+        suggestion_prompt = PromptTemplate.from_template("""
+You are an AI tutor helping {student_name}, a {grade_level} student learning {subject}.
+
+Based on the student's question: "{question}"
+And your response: "{response}"
+
+Generate exactly 3 follow-up questions or prompts that would help the student:
+1. Deepen their understanding of the current topic
+2. Explore related concepts
+3. Apply what they've learned
+
+Make the suggestions:
+- Specific and actionable
+- Appropriate for {grade_level} level
+- Related to {subject}
+- Encouraging and engaging
+- 10-15 words each maximum
+
+Format as a simple list, one per line, no numbering or bullets.
+
+Examples of good suggestions:
+- "Can you explain this with a real-world example?"
+- "What happens if we change this variable?"
+- "How does this relate to what we learned earlier?"
+- "Can you give me a practice problem?"
+- "What are the common mistakes students make here?"
+
+Suggestions:
+""")
+
+        llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY, temperature=0.7)
+        chain = suggestion_prompt.partial(
+            student_name=student_name,
+            grade_level=grade_level,
+            subject=subject
+        ) | llm
+
+        result = chain.invoke({
+            "question": question,
+            "response": response
+        })
+
+        raw_suggestions = str(result.content if hasattr(result, "content") else result)
+        
+        # Parse the suggestions
+        suggestions = []
+        for line in raw_suggestions.split('\n'):
+            line = line.strip()
+            if line and not line.startswith(('Suggestions:', 'Examples:', 'Format')):
+                # Remove any numbering or bullets
+                line = line.lstrip('123456789.-•* ')
+                if len(line) > 5 and len(line) < 100:  # Reasonable length
+                    suggestions.append(line)
+        
+        # Ensure we have exactly 3 suggestions
+        if len(suggestions) >= 3:
+            return suggestions[:3]
+        elif len(suggestions) > 0:
+            # Fill with fallback suggestions if needed
+            fallbacks = [
+                "Can you explain this concept with an example?",
+                "How does this apply to real life?",
+                f"What should I study next in {subject}?"
+            ]
+            while len(suggestions) < 3:
+                suggestions.append(fallbacks[len(suggestions) % len(fallbacks)])
+            return suggestions[:3]
+        else:
+            # Fallback suggestions if AI generation fails
+            return [
+                "Can you explain this with a real-world example?",
+                f"How does this relate to other {subject} concepts?",
+                "Can you give me a practice problem on this topic?"
+            ]
+
+    except Exception as e:
+        print(f"⚠️ Error generating prompt suggestions: {e}")
+        # Return fallback suggestions
+        return [
+            "Can you explain this with an example?",
+            "How does this work in practice?",
+            f"What should I study next in {subject}?"
+        ]

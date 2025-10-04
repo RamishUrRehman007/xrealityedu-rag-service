@@ -7,7 +7,7 @@ import asyncio
 from functools import partial
 from dotenv import load_dotenv
 
-from retrieve_and_respond import answer_question, get_user_chat_history, suggest_topics_with_ai
+from retrieve_and_respond import answer_question, get_user_chat_history, suggest_topics_with_ai, generate_prompt_suggestions
 from store_chat_to_pinecone import store_chat_to_pinecone
 
 load_dotenv()
@@ -192,7 +192,32 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             chat_logs[room_id].append(f"AI: {response_text}")
             chat_logs[room_id] = chat_logs[room_id][-10:]
 
+            # Generate prompt suggestions for the response
+            try:
+                suggestions = generate_prompt_suggestions(
+                    question=user_message,
+                    response=response_text,
+                    subject=subject,
+                    student_name=student_name,
+                    grade_level=grade,
+                    history=history
+                )
+            except Exception as e:
+                print(f"⚠️ Error generating suggestions: {e}")
+                suggestions = []
+
+            # Send the main response
             await websocket.send_json({"message": response_text, "user_id": "AI_TUTOR"})
+            
+            # Send prompt suggestions if available (only for regular conversations, not quizzes)
+            if suggestions and len(suggestions) > 0 and "Choose A, B, C, or D" not in response_text:
+                await asyncio.sleep(0.5)  # Small delay for better UX
+                await websocket.send_json({
+                    "message": "💡 Here are some follow-up questions you might ask:",
+                    "suggestions": suggestions,
+                    "type": "prompt_suggestions",
+                    "user_id": "AI_TUTOR"
+                })
 
     except WebSocketDisconnect:
         print(f"🔴 Disconnected from room: {room_id}")
