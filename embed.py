@@ -63,8 +63,11 @@ def embed_pdf(file_path, metadata):
         vectors = [{
             "id": str(uuid.uuid4()),
             "values": embedding,
-            "metadata": meta
-        } for embedding, meta in zip(embeddings, batch_metas)]
+            "metadata": {
+                **meta,
+                "text": text  # Store the actual text content
+            }
+        } for embedding, meta, text in zip(embeddings, batch_metas, batch_texts)]
 
         index.upsert(vectors=vectors)
         uploaded += len(vectors)
