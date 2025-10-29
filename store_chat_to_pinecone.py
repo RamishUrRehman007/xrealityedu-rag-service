@@ -7,7 +7,7 @@ from datetime import datetime
 
 load_dotenv()
 
-def store_chat_to_pinecone(chat_history, student="Student", grade="", room_id=""):
+def store_chat_to_pinecone(chat_history, student="Student", grade="", room_id="", subject="physics"):
     if not chat_history:
         return {"status": "no chat to store"}
 
@@ -48,7 +48,9 @@ def store_chat_to_pinecone(chat_history, student="Student", grade="", room_id=""
             "grade": grade,
             "room_id": room_id,
             "type": "interaction",
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.utcnow().isoformat(),
+            "text": combined_text,  # Store the actual chat content
+            "subject": subject.lower()  # Use the provided subject
         }
     }
 

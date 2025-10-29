@@ -2,13 +2,16 @@ import os
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
-from langchain_core.prompts import PromptTemplate
-from langchain.chains.retrieval import create_retrieval_chain
+from langchain.prompts import PromptTemplate
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
+
+# Configuration for document retrieval quality
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.7"))  # 70% similarity threshold
+MAX_RETRIEVAL_CANDIDATES = int(os.getenv("MAX_RETRIEVAL_CANDIDATES", "10"))  # Max documents to consider
 
 intro_prompt = PromptTemplate.from_template("""
 You are a cheerful, encouraging, and patient AI tutor named XRTutor. You help {student_name}, a {grade_level} learner, understand the topic of **{subject}**.
@@ -20,7 +23,10 @@ Start by introducing yourself and asking:
 
 After that, begin teaching.
 
-Context:
+Context from knowledge base:
+{context}
+
+Previous conversation:
 {history}
 
 Student said:
@@ -41,7 +47,10 @@ If they seem confused or unsure:
 
 End every few responses by asking if the student wants to try a short quiz.
 
-Context:
+Context from knowledge base:
+{context}
+
+Previous conversation:
 {history}
 
 Student said:
@@ -58,7 +67,10 @@ Create a 1-question multiple choice quiz about this topic. Only provide:
 - 4 options labeled A, B, C, and D
 - Ask student to pick one option
 
-Context:
+Context from knowledge base:
+{context}
+
+Previous conversation:
 {history}
 
 Student said:
@@ -77,7 +89,7 @@ def answer_question(question: str, history: str, subject: str, student_name: str
     )
 
     retriever = vectorstore.as_retriever(search_kwargs={
-        "k": 5,
+        "k": 10,  # Get more candidates to filter from
         "filter": {
             "source": subject.lower(),
             "grade": grade_level
@@ -94,31 +106,82 @@ def answer_question(question: str, history: str, subject: str, student_name: str
         chain = tutoring_prompt.partial(student_name=student_name, grade_level=grade_level, subject=subject) | llm
 
     try:
-        retrieved_docs = retriever.invoke(question)
-        docs_found = bool(retrieved_docs)
+        # Get documents with similarity scores using direct Pinecone query
+        # Note: Documents were stored directly to Pinecone, not through LangChain
+        from pinecone import Pinecone
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        index = pc.Index(PINECONE_INDEX_NAME)
+        
+        # Generate embedding for the question
+        question_embedding = embedding.embed_query(question)
+        
+        # Query Pinecone directly
+        query_response = index.query(
+            vector=question_embedding,
+            top_k=MAX_RETRIEVAL_CANDIDATES,
+            include_metadata=True,
+            filter={
+                "subject": subject.capitalize()  # Match 'Physics', 'Math', etc.
+            }
+        )
+        
+        # Filter documents by similarity score threshold
+        relevant_docs = []
+        
+        for match in query_response.matches:
+            # Convert cosine similarity to percentage (0-1 range)
+            similarity_score = (1 + match.score) / 2  # Convert from [-1,1] to [0,1]
+            print(f"📊 Document similarity: {similarity_score:.3f} (threshold: {SIMILARITY_THRESHOLD})")
+            
+            if similarity_score >= SIMILARITY_THRESHOLD:
+                # Extract text content from metadata (stored as 'text' key)
+                text_content = match.metadata.get('text', '')
+                if text_content:
+                    relevant_docs.append({
+                        'content': text_content,
+                        'metadata': match.metadata,
+                        'score': similarity_score
+                    })
+                    print(f"✅ Document passed threshold: {text_content[:100]}...")
+                else:
+                    print(f"❌ Document has no text content")
+            else:
+                print(f"❌ Document below threshold: {match.metadata.get('text', '')[:100]}...")
+        
+        docs_found = len(relevant_docs) > 0
+        print(f"📚 Found {len(relevant_docs)} relevant documents out of {len(query_response.matches)} candidates")
+        
     except Exception as e:
         print(f"Retrieval error: {e}")
         docs_found = False
+        relevant_docs = []
 
     if docs_found:
         try:
-            retrieval_chain = create_retrieval_chain(retriever, chain)
-            result = retrieval_chain.invoke({
+            # Use only the high-quality retrieved documents
+            context = "\n".join([doc['content'] for doc in relevant_docs])
+            print(f"📖 Using context from {len(relevant_docs)} high-quality documents")
+            
+            result = chain.invoke({
                 "input": question,
-                "history": history
+                "history": history,
+                "context": context
             })
-            answer = result["answer"]
+            answer = result
         except Exception as e:
             print(f"Retrieval chain error: {e}")
             result = chain.invoke({
                 "input": question,
-                "history": history
+                "history": history,
+                "context": ""
             })
             answer = result
     else:
+        print("⚠️ No relevant documents found in knowledge base - using general knowledge")
         result = chain.invoke({
             "input": question,
-            "history": history
+            "history": history,
+            "context": ""
         })
         answer = result
 
@@ -194,22 +257,135 @@ def suggest_topics_with_ai(subject: str, grade: str, student_name: str = "", stu
     return fallback_topics.get(subject.lower(), ["General Topic 1", "Topic 2", "Topic 3"])
 
 def get_user_chat_history(student_id: str, subject: str):
-    embedding = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-    vectorstore = PineconeVectorStore(
-        index_name=PINECONE_INDEX_NAME,
-        embedding=embedding,
-        pinecone_api_key=PINECONE_API_KEY,
-        namespace="default"
-    )
-
-    retriever = vectorstore.as_retriever(
-        search_kwargs={
-            "k": 5,
-            "filter": {
+    """Retrieve user's chat history from Pinecone"""
+    try:
+        from pinecone import Pinecone
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        index = pc.Index(PINECONE_INDEX_NAME)
+        
+        # Query for chat history with this student and subject
+        query_response = index.query(
+            vector=[0.1] * 1536,  # Dummy vector for metadata search
+            top_k=20,  # Get more results
+            include_metadata=True,
+            filter={
                 "student": student_id,
                 "source": "chat-history",
                 "type": "interaction"
             }
-        }
-    )
-    return retriever.invoke(f"past interactions in {subject}")
+        )
+        
+        # Extract chat history from metadata
+        chat_history = []
+        for match in query_response.matches:
+            if 'text' in match.metadata:
+                # Check if this is for the right subject
+                entry_subject = match.metadata.get('subject', '').lower()
+                if entry_subject == subject.lower():
+                    chat_history.append({
+                        'text': match.metadata['text'],
+                        'timestamp': match.metadata.get('timestamp', '')
+                    })
+        
+        # Sort by timestamp if available
+        chat_history.sort(key=lambda x: x.get('timestamp', ''))
+        
+        # Extract just the text for return
+        chat_history = [entry['text'] for entry in chat_history]
+        
+        print(f"📚 Retrieved {len(chat_history)} chat history entries for {student_id} in {subject}")
+        return chat_history
+        
+    except Exception as e:
+        print(f"⚠️ Error retrieving chat history: {e}")
+        return []
+
+def generate_prompt_suggestions(question: str, response: str, subject: str, student_name: str, grade_level: str, history: str = "") -> list:
+    """
+    Generate 3 contextual prompt suggestions based on the current conversation
+    """
+    try:
+        # Create a prompt for generating follow-up questions
+        suggestion_prompt = PromptTemplate.from_template("""
+You are an AI tutor helping {student_name}, a {grade_level} student learning {subject}.
+
+Based on the student's question: "{question}"
+And your response: "{response}"
+
+Generate exactly 3 follow-up questions or prompts that would help the student:
+1. Deepen their understanding of the current topic
+2. Explore related concepts
+3. Apply what they've learned
+
+Make the suggestions:
+- Specific and actionable
+- Appropriate for {grade_level} level
+- Related to {subject}
+- Encouraging and engaging
+- 10-15 words each maximum
+
+Format as a simple list, one per line, no numbering or bullets.
+
+Examples of good suggestions:
+- "Can you explain this with a real-world example?"
+- "What happens if we change this variable?"
+- "How does this relate to what we learned earlier?"
+- "Can you give me a practice problem?"
+- "What are the common mistakes students make here?"
+
+Suggestions:
+""")
+
+        llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY, temperature=0.7)
+        chain = suggestion_prompt.partial(
+            student_name=student_name,
+            grade_level=grade_level,
+            subject=subject
+        ) | llm
+
+        result = chain.invoke({
+            "question": question,
+            "response": response
+        })
+
+        raw_suggestions = str(result.content if hasattr(result, "content") else result)
+        
+        # Parse the suggestions
+        suggestions = []
+        for line in raw_suggestions.split('\n'):
+            line = line.strip()
+            if line and not line.startswith(('Suggestions:', 'Examples:', 'Format')):
+                # Remove any numbering or bullets
+                line = line.lstrip('123456789.-•* ')
+                if len(line) > 5 and len(line) < 100:  # Reasonable length
+                    suggestions.append(line)
+        
+        # Ensure we have exactly 3 suggestions
+        if len(suggestions) >= 3:
+            return suggestions[:3]
+        elif len(suggestions) > 0:
+            # Fill with fallback suggestions if needed
+            fallbacks = [
+                "Can you explain this concept with an example?",
+                "How does this apply to real life?",
+                f"What should I study next in {subject}?"
+            ]
+            while len(suggestions) < 3:
+                suggestions.append(fallbacks[len(suggestions) % len(fallbacks)])
+            return suggestions[:3]
+        else:
+            # Fallback suggestions if AI generation fails
+            return [
+                "Can you explain this with a real-world example?",
+                f"How does this relate to other {subject} concepts?",
+                "Can you give me a practice problem on this topic?"
+            ]
+
+    except Exception as e:
+        print(f"⚠️ Error generating prompt suggestions: {e}")
+        # Return fallback suggestions
+        return [
+            "Can you explain this with an example?",
+            "How does this work in practice?",
+            f"What should I study next in {subject}?"
+        ]

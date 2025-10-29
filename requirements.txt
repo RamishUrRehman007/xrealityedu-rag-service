@@ -1,6 +1,9 @@
 fastapi
 uvicorn
 langchain
+langchain-openai
+langchain-pinecone
+langchain-community
 openai
 pinecone-client
 pypdf

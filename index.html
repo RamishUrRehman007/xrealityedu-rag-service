@@ -24,6 +24,9 @@
 
   <h3>💬 Chat Log:</h3>
   <div id="log"></div>
+  
+  <h3>💡 Suggested Questions:</h3>
+  <div id="suggestions"></div>
 
   <script>
     let socket = null;
@@ -47,7 +50,42 @@
       socket.onmessage = (event) => {
         const data = JSON.parse(event.data);
         log(`🤖 AI: ${data.message}`);
+        
+        // Handle prompt suggestions
+        if (data.type === "prompt_suggestions" && data.suggestions) {
+          displaySuggestions(data.suggestions);
+        }
       };
+    }
+
+    function displaySuggestions(suggestions) {
+      const suggestionsDiv = document.getElementById("suggestions");
+      suggestionsDiv.innerHTML = "";
+      
+      suggestions.forEach((suggestion, index) => {
+        const button = document.createElement("button");
+        button.textContent = suggestion;
+        button.style.cssText = `
+          display: block;
+          width: 100%;
+          margin: 5px 0;
+          padding: 10px;
+          background: #e3f2fd;
+          border: 1px solid #2196f3;
+          border-radius: 5px;
+          cursor: pointer;
+          text-align: left;
+          font-size: 14px;
+        `;
+        button.onclick = () => useSuggestion(suggestion);
+        suggestionsDiv.appendChild(button);
+      });
+    }
+
+    function useSuggestion(suggestion) {
+      const input = document.getElementById("msgInput");
+      input.value = suggestion;
+      sendMessage();
     }
 
     function sendMessage() {
@@ -61,12 +99,18 @@
 
       const payload = {
         user_id: "student123",
+        student_name: "Test Student",
+        grade: "Grade 10",
+        subject: "physics",
         message: message
       };
 
       log(`🧑 You: ${message}`);
       socket.send(JSON.stringify(payload));
       input.value = "";
+      
+      // Clear suggestions when user sends a message
+      document.getElementById("suggestions").innerHTML = "";
     }
   </script>
 

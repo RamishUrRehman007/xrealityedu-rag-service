@@ -7,7 +7,7 @@ import asyncio
 from functools import partial
 from dotenv import load_dotenv
 
-from retrieve_and_respond import answer_question, get_user_chat_history, suggest_topics_with_ai
+from retrieve_and_respond import answer_question, get_user_chat_history, suggest_topics_with_ai, generate_prompt_suggestions
 from store_chat_to_pinecone import store_chat_to_pinecone
 
 load_dotenv()
@@ -68,25 +68,34 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             if not welcome_sent[room_id]:
                 welcome_sent[room_id] = True
 
-                # Load history only once
-                history_docs = get_user_chat_history(user_id, subject)
-                for doc in history_docs:
-                    chat_logs[room_id].append(f"User: {student_name}")
-                    chat_logs[room_id].append(f"AI: {doc.page_content}")
-
-                if len(history_docs) > 0 and state["step"] == "awaiting_topic":
+                # Load chat history for this user and subject
+                history_entries = get_user_chat_history(user_id, subject)
+                
+                if len(history_entries) > 0:
+                    # Load previous chat history into current session
+                    for entry in history_entries[-10:]:  # Load last 10 interactions
+                        chat_logs[room_id].append(entry)
+                    
                     # If history exists, continue directly
                     state["step"] = "tutoring"
                     state["quiz_permission"] = True
                     await websocket.send_json({
-                        "message": f"📚 Welcome back {student_name}! I’ve loaded your past session. Let’s continue with **{subject}**. What would you like to do next?",
+                        "message": f"📚 Welcome back {student_name}! I've loaded your past session with **{subject}**. Let's continue where we left off!",
                         "user_id": "AI_TUTOR"
                     })
+                    
+                    # Show recent conversation context
+                    if len(history_entries) > 0:
+                        recent_context = history_entries[-2] if len(history_entries) >= 2 else history_entries[-1]
+                        await websocket.send_json({
+                            "message": f"💭 Last time we discussed: {recent_context[:100]}...",
+                            "user_id": "AI_TUTOR"
+                        })
                     continue
 
                 # Otherwise, fresh start
                 await websocket.send_json({
-                    "message": f"👋 Hi {student_name}, I'm your AI tutor and I’m excited to help you today!\nWhat would you like to learn about in **{subject}**?",
+                    "message": f"👋 Hi {student_name}, I'm your AI tutor and I'm excited to help you today!\nWhat would you like to learn about in **{subject}**?",
                     "user_id": "AI_TUTOR"
                 })
 
@@ -192,7 +201,32 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             chat_logs[room_id].append(f"AI: {response_text}")
             chat_logs[room_id] = chat_logs[room_id][-10:]
 
+            # Generate prompt suggestions for the response
+            try:
+                suggestions = generate_prompt_suggestions(
+                    question=user_message,
+                    response=response_text,
+                    subject=subject,
+                    student_name=student_name,
+                    grade_level=grade,
+                    history=history
+                )
+            except Exception as e:
+                print(f"⚠️ Error generating suggestions: {e}")
+                suggestions = []
+
+            # Send the main response
             await websocket.send_json({"message": response_text, "user_id": "AI_TUTOR"})
+            
+            # Send prompt suggestions if available (only for regular conversations, not quizzes)
+            if suggestions and len(suggestions) > 0 and "Choose A, B, C, or D" not in response_text:
+                await asyncio.sleep(0.5)  # Small delay for better UX
+                await websocket.send_json({
+                    "message": "💡 Here are some follow-up questions you might ask:",
+                    "suggestions": suggestions,
+                    "type": "prompt_suggestions",
+                    "user_id": "AI_TUTOR"
+                })
 
     except WebSocketDisconnect:
         print(f"🔴 Disconnected from room: {room_id}")
@@ -203,7 +237,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 chat_history=chat_logs[room_id],
                 student=user_id,
                 grade=grade,
-                room_id=room_id
+                room_id=room_id,
+                subject=subject
             )
             print(f"📦 Chat stored to Pinecone: {result}")
 
