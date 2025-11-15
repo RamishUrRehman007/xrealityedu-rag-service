@@ -1,4 +1,5 @@
 import os
+import numpy as np
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
@@ -389,3 +390,65 @@ Suggestions:
             "How does this work in practice?",
             f"What should I study next in {subject}?"
         ]
+
+def check_question_similarity(new_question: str, previous_questions: list, similarity_threshold: float = 0.85) -> tuple:
+    """
+    Check if a new question is similar to previous questions using embeddings.
+    
+    Returns:
+        tuple: (is_similar: bool, similar_count: int, most_similar_question: str)
+    """
+    if not previous_questions:
+        return False, 0, None
+    
+    try:
+        embedding = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+        new_question_embedding = embedding.embed_query(new_question.lower())
+        
+        similar_count = 0
+        most_similar_question = None
+        highest_similarity = 0
+        
+        # Embed previous questions and compare
+        for prev_q in previous_questions:
+            prev_q_embedding = embedding.embed_query(prev_q.lower())
+            
+            # Calculate cosine similarity
+            similarity = np.dot(new_question_embedding, prev_q_embedding) / (
+                np.linalg.norm(new_question_embedding) * np.linalg.norm(prev_q_embedding)
+            )
+            
+            if similarity >= similarity_threshold:
+                similar_count += 1
+                if similarity > highest_similarity:
+                    highest_similarity = similarity
+                    most_similar_question = prev_q
+        
+        is_similar = similar_count > 0
+        return is_similar, similar_count, most_similar_question
+        
+    except Exception as e:
+        print(f"⚠️ Error checking question similarity: {e}")
+        # Fallback: simple text similarity check
+        new_question_lower = new_question.lower().strip()
+        similar_count = 0
+        most_similar_question = None
+        
+        for prev_q in previous_questions:
+            prev_q_lower = prev_q.lower().strip()
+            # Check exact match or very high word overlap
+            if prev_q_lower == new_question_lower:
+                similar_count += 1
+                most_similar_question = prev_q
+            else:
+                # Simple word overlap check
+                new_words = set(new_question_lower.split())
+                prev_words = set(prev_q_lower.split())
+                if len(new_words) > 0 and len(prev_words) > 0:
+                    overlap = len(new_words & prev_words) / max(len(new_words), len(prev_words))
+                    if overlap >= 0.7:  # 70% word overlap
+                        similar_count += 1
+                        if most_similar_question is None:
+                            most_similar_question = prev_q
+        
+        return similar_count > 0, similar_count, most_similar_question

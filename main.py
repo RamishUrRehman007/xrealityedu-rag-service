@@ -7,7 +7,7 @@ import asyncio
 from functools import partial
 from dotenv import load_dotenv
 
-from retrieve_and_respond import answer_question, get_user_chat_history, suggest_topics_with_ai, generate_prompt_suggestions
+from retrieve_and_respond import answer_question, get_user_chat_history, suggest_topics_with_ai, generate_prompt_suggestions, check_question_similarity
 from store_chat_to_pinecone import store_chat_to_pinecone
 
 load_dotenv()
@@ -26,6 +26,7 @@ connections: Dict[str, List[WebSocket]] = {}
 chat_logs: Dict[str, List[str]] = {}
 welcome_sent: Dict[str, bool] = {}
 tutor_state: Dict[str, Dict] = {}
+question_history: Dict[str, List[str]] = {}  # Track questions per room for repeat detection
 
 @app.websocket("/wss/qa_chat/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str):
@@ -46,6 +47,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             "prior_knowledge": None,
             "quiz_permission": False
         }
+    if room_id not in question_history:
+        question_history[room_id] = []
 
     connections[room_id].append(websocket)
 
@@ -180,6 +183,42 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 })
                 continue
 
+            # Check for repeated similar questions (only in tutoring mode)
+            if state["step"] == "tutoring":
+                previous_questions = question_history.get(room_id, [])
+                if len(previous_questions) >= 2:  # Need at least 2 previous questions to check
+                    is_similar, similar_count, most_similar_q = check_question_similarity(
+                        user_message, 
+                        previous_questions,
+                        similarity_threshold=0.85
+                    )
+                    
+                    # If this question is similar to 2+ previous questions, suggest moving on
+                    if is_similar and similar_count >= 2:  
+                        # Get topic suggestions for next topic
+                        topics = suggest_topics_with_ai(subject, grade, student_name, student_id=user_id)
+                        await websocket.send_json({
+                            "message": f"🔄 I notice you've asked about this topic a few times. It might be helpful to move on to a new topic to keep learning fresh! Let's explore something new in **{subject}**.",
+                            "user_id": "AI_TUTOR"
+                        })
+                        await websocket.send_json({
+                            "message": f"📘 Here are some new topics you might explore in **{subject}**:",
+                            "topics": topics,
+                            "type": "topic_suggestions",
+                            "user_id": "AI_TUTOR"
+                        })
+                        # Clear question history to start fresh with new topic
+                        question_history[room_id] = []
+                        continue
+                    elif is_similar:
+                        # First or second similar question - still answer but track it
+                        print(f"⚠️ Similar question detected ({similar_count} similar questions found). Most similar: {most_similar_q}")
+
+            # Track the question
+            question_history[room_id].append(user_message)
+            # Keep only last 20 questions to avoid memory issues
+            question_history[room_id] = question_history[room_id][-20:]
+
             # Regular tutoring flow
             history = "\n".join(chat_logs[room_id][-6:])
             loop = asyncio.get_event_loop()
@@ -242,5 +281,5 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             )
             print(f"📦 Chat stored to Pinecone: {result}")
 
-        for store in [connections, chat_logs, welcome_sent, tutor_state]:
+        for store in [connections, chat_logs, welcome_sent, tutor_state, question_history]:
             store.pop(room_id, None)

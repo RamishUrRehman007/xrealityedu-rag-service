@@ -8,4 +8,5 @@ openai
 pinecone-client
 pypdf
 python-dotenv
+numpy
 
