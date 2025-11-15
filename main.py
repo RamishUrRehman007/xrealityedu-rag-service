@@ -312,11 +312,18 @@ async def upload_file_for_embedding(
     - Status and number of chunks uploaded to Pinecone
     """
     try:
+        # Validate file and filename
+        if not file.filename:
+            raise HTTPException(
+                status_code=400,
+                detail="Filename is required"
+            )
+        
         # Validate file type
         allowed_extensions = ['.pdf', '.txt', '.md']
         file_extension = os.path.splitext(file.filename)[1].lower()
         
-        if file_extension not in allowed_extensions:
+        if not file_extension or file_extension not in allowed_extensions:
             raise HTTPException(
                 status_code=400,
                 detail=f"File type {file_extension} not supported. Allowed types: {', '.join(allowed_extensions)}"
@@ -338,7 +345,7 @@ async def upload_file_for_embedding(
         # Prepare metadata
         metadata = {
             "subject": subject.capitalize(),  # Capitalize for consistency with existing data
-            "source": source or filename.replace(file_extension, ""),
+            "source": source or os.path.splitext(filename)[0],  # Use filename without extension
         }
         
         if grade:
@@ -387,13 +394,27 @@ def embed_text_file(file_path: str, metadata: dict):
     from pinecone import Pinecone, ServerlessSpec
     import uuid
     
-    # Read text file
-    with open(file_path, 'r', encoding='utf-8') as f:
-        content = f.read()
+    # Read text file with error handling for encoding
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except UnicodeDecodeError:
+        # Try with different encoding if UTF-8 fails
+        try:
+            with open(file_path, 'r', encoding='latin-1') as f:
+                content = f.read()
+        except Exception as e:
+            raise Exception(f"Failed to read file with UTF-8 or Latin-1 encoding: {str(e)}")
+    
+    if not content or len(content.strip()) == 0:
+        raise Exception("File is empty or contains no text content")
     
     # Split into chunks
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     texts = text_splitter.split_text(content)
+    
+    if not texts or len(texts) == 0:
+        raise Exception("No text chunks could be extracted from the file")
     
     # Prepare metadata for each chunk
     metadatas = [metadata.copy() for _ in texts]
