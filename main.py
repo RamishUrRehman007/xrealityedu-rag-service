@@ -14,6 +14,13 @@ from embed import embed_pdf
 
 load_dotenv()
 
+# Configure FastAPI with larger file upload limit
+# Default Starlette limit is 1MB for request body
+# You can set MAX_FILE_SIZE_MB in .env (default: 500MB)
+# Note: If using nginx as reverse proxy, configure client_max_body_size in nginx config
+# The endpoint validates file size and returns a clear error if exceeded (default: 500MB)
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "500"))
+
 app = FastAPI()
 
 app.add_middleware(
@@ -329,6 +336,27 @@ async def upload_file_for_embedding(
                 detail=f"File type {file_extension} not supported. Allowed types: {', '.join(allowed_extensions)}"
             )
         
+        # Get file size limit from environment (default: 500MB)
+        MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "500")) * 1024 * 1024  # Convert MB to bytes
+        
+        # Read file contents
+        contents = await file.read()
+        
+        # Validate file size
+        file_size = len(contents)
+        if file_size > MAX_FILE_SIZE:
+            max_size_mb = MAX_FILE_SIZE / (1024 * 1024)
+            raise HTTPException(
+                status_code=413,  # 413 Payload Too Large
+                detail=f"File size ({file_size / (1024 * 1024):.2f} MB) exceeds maximum allowed size ({max_size_mb:.0f} MB). Please upload a smaller file."
+            )
+        
+        if file_size == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="File is empty"
+            )
+        
         # Create uploads directory if it doesn't exist
         os.makedirs("uploads", exist_ok=True)
         
@@ -336,7 +364,8 @@ async def upload_file_for_embedding(
         filename = file.filename
         save_path = f"uploads/{filename}"
         
-        contents = await file.read()
+        with open(save_path, "wb") as f:
+            f.write(contents)
         with open(save_path, "wb") as f:
             f.write(contents)
         
