@@ -123,18 +123,18 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             # Tutor state logic
             if state["step"] == "awaiting_topic":
                 state["topic"] = user_message
-                state["step"] = "awaiting_level"
-                await websocket.send_json({
-                    "message": "Great! Are you a high school student, college student, or a professional?",
-                    "user_id": "AI_TUTOR"
-                })
-                continue
-
-            elif state["step"] == "awaiting_level":
-                state["level"] = user_message.lower()
+                # Infer level from grade (already provided in payload)
+                # Grade format: "Grade 10", "Grade 12", etc.
+                if "grade" in grade.lower() or any(g in grade.lower() for g in ["9", "10", "11", "12"]):
+                    state["level"] = "high school student"
+                elif any(g in grade.lower() for g in ["college", "university", "undergrad"]):
+                    state["level"] = "college student"
+                else:
+                    state["level"] = grade  # Use grade as-is if format is different
+                
                 state["step"] = "awaiting_prior_knowledge"
                 await websocket.send_json({
-                    "message": f"Thanks! What do you already know about **{state['topic']}**?",
+                    "message": f"Great! What do you already know about **{state['topic']}**?",
                     "user_id": "AI_TUTOR"
                 })
                 continue
