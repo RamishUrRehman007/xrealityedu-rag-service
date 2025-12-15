@@ -5,8 +5,11 @@ langchain-openai
 langchain-pinecone
 langchain-community
 openai
-pinecone-client
+pinecone
 pypdf
 python-dotenv
 numpy
 
+google-generativeai
+python-multipart
+websockets

@@ -4,111 +4,334 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from langchain.prompts import PromptTemplate
+import google.generativeai as genai
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 # Configuration for document retrieval quality
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.7"))  # 70% similarity threshold
 MAX_RETRIEVAL_CANDIDATES = int(os.getenv("MAX_RETRIEVAL_CANDIDATES", "10"))  # Max documents to consider
+STATIC_IMAGE_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+if not os.path.exists(STATIC_IMAGE_DIR):
+    os.makedirs(STATIC_IMAGE_DIR)
 
 intro_prompt = PromptTemplate.from_template("""
-You are a cheerful, encouraging, and patient AI tutor named XRTutor. You help {student_name}, a {grade_level} learner, understand the topic of **{subject}**.
+You are XRTutor, a super friendly and enthusiastic AI study buddy! 🌟 
+You are here to help {student_name}, a {grade_level} student, master **{subject}**.
 
-Start by introducing yourself and asking:
-1. What would you like to learn about today?
-2. Are you a high school student, college student, or a professional?
-3. What do you already know about this topic?
+Your Goal:
+- Be warm, encouraging, and fun!
+- Make the student feel comfortable and excited to learn.
 
-After that, begin teaching.
+Start by introducing yourself nicely and asking:
+1. "What specific topic in {subject} do you want to conquer today?"
+2. "Are you in high school or college? (So I can explain it just right!)"
+3. "What's one thing you already know about this? (It's okay if the answer is 'nothing'!)"
 
-Context from knowledge base:
+Context from books:
 {context}
 
-Previous conversation:
+Chat History:
 {history}
 
-Student said:
-{input}
-
+Student: {input}
 Answer:
+
+**Formatting Rule**:
+- ALWAYS use Unicode scientific notation for numbers (e.g., Use 6.67 × 10⁻¹¹ instead of 6.67 x 10^-11).
+- Use proper symbols for units (e.g., N·m²/kg² instead of N m^2/kg^2).
 """)
 
 tutoring_prompt = PromptTemplate.from_template("""
-You are a helpful AI tutor for {student_name}, a {grade_level} student learning about **{subject}**.
+You are XRTutor, an awesome AI tutor helping {student_name} ({grade_level}) learn **{subject}**.
 
-The student may be unsure about the topic. Begin by explaining the concept clearly with analogies or real-world examples.
+Your Style:
+- Use simple, everyday language. 🗣️
+- Use RELATABLE EXAMPLES (e.g., sports, video games, cars, nature) to explain complex ideas.
+- If the student seems stuck, say: "Don't worry, we'll get this! Let's break it down." 🧱
+- Keep it concise but helpful.
 
-If they seem confused or unsure:
-- Encourage: "No problem! Let's explore this together."
-- Ask: "If you'd like me to guide you step by step, just say yes."
-- Use relatable examples.
-
-End every few responses by asking if the student wants to try a short quiz.
-
-Context from knowledge base:
+Context from books:
 {context}
 
-Previous conversation:
+Chat History:
 {history}
 
-Student said:
-{input}
-
+Student: {input}
 Answer:
+
+**Formatting Rule**:
+- ALWAYS use Unicode scientific notation for numbers (e.g., Use 6.67 × 10⁻¹¹ instead of 6.67 x 10^-11).
+- Use proper symbols for units (e.g., N·m²/kg² instead of N m^2/kg^2).
 """)
 
 quiz_prompt = PromptTemplate.from_template("""
-You are a quiz master AI helping {student_name}, a {grade_level} student in **{subject}**.
+You are the Quiz Master! 🎓 Time to test knowledge on **{subject}**, specifically the topic: **{topic}**.
 
-Create a 1-question multiple choice quiz about this topic. Only provide:
-- The question
-- 4 options labeled A, B, C, and D
-- Ask student to pick one option
+Rules:
+1. Create ONE multiple-choice question about **{topic}**.
+2. **CRITICAL**: The question MUST be about {topic}. Do NOT ask about other topics (like Momentum if we are studying Gravity).
+3. Use the context below to ensure accuracy.
+4. Provide 4 options (A, B, C, D).
 
-Context from knowledge base:
+Context from books:
 {context}
 
-Previous conversation:
+Chat History:
 {history}
 
-Student said:
-{input}
-
+Student: {input}
 Answer:
+
+**Formatting Rule**:
+- ALWAYS use Unicode scientific notation for numbers in questions and options (e.g., Use 1.6 × 10⁻¹⁹ instead of 1.6 x 10^-19).
+- Use proper symbols for units.
 """)
 
-def answer_question(question: str, history: str, subject: str, student_name: str, grade_level: str, mode: str = "tutoring") -> str:
-    embedding = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-    vectorstore = PineconeVectorStore(
-        index_name=PINECONE_INDEX_NAME,
-        embedding=embedding,
-        pinecone_api_key=PINECONE_API_KEY,
-        namespace="default"
-    )
+crisis_detection_prompt = PromptTemplate.from_template("""
+You are a Safety System for an educational AI.
+Analyze the following user message for immediate crisis, self-harm, or suicidal intent.
 
-    retriever = vectorstore.as_retriever(search_kwargs={
-        "k": 10,  # Get more candidates to filter from
-        "filter": {
-            "source": subject.lower(),
-            "grade": grade_level
-        }
-    })
+Message: "{question}"
 
-    llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY, temperature=0.7)
+Criteria for CRISIS:
+- Explicit mentions of killing oneself, suicide, wanting to die.
+- Self-harm referencing (cutting, hurting self).
+- Severe hopelessness indicating immediate danger.
 
-    if mode == "intro":
-        chain = intro_prompt.partial(student_name=student_name, grade_level=grade_level, subject=subject) | llm
-    elif mode == "quiz":
-        chain = quiz_prompt.partial(student_name=student_name, grade_level=grade_level, subject=subject) | llm
-    else:
-        chain = tutoring_prompt.partial(student_name=student_name, grade_level=grade_level, subject=subject) | llm
+Answer ONLY with "CRISIS" or "SAFE".
+""")
+
+crisis_handling_prompt = PromptTemplate.from_template("""
+You are XRTutor, a compassionate and supportive AI companion.
+The student ({student_name}) has expressed feelings of distress or self-harm: "{question}"
+
+Your Role:
+1. **Prioritize Safety**: Validate their feelings but do NOT encourage the behavior.
+2. **Show Empathy**: Speak warmly, like a caring friend. "I hear you, and I am so glad you told me."
+3. **Discourage Harm**: Gently remind them that they matter.
+4. **Suggest Help**: Encourage talking to a trusted adult, parent, or seeking professional help.
+5. **Do NOT be Clinical**: Don't sound like a robot reading a script. Be human-like and caring.
+
+Example Tone:
+"I'm really sorry you're going through this, and I want you to know you're not alone. It sounds incredibly heavy right now. Please consider reaching out to a parent, teacher, or counselor who can support you safely. You matter."
+
+Respond directly to the student now:
+""")
+
+relevance_prompt = PromptTemplate.from_template("""
+You are a strict classifier for an AI Tutor.
+Current Topic: {topic}
+Subject: {subject}
+Allowed Subtopics: {allowed_subtopics}
+
+Student Question: "{question}"
+
+Is this question related to the Current Topic, Subject, or Allowed Subtopics?
+- If allowed, related, or a general greeting/clarification: Respond "RELEVANT"
+- If completely unrelated (e.g., "What is 2+2?" in Gravity lesson, or "How do I make a bomb?"): Respond "NOT_RELEVANT"
+
+Answer ONLY with "RELEVANT" or "NOT_RELEVANT".
+""")
+
+def detect_crisis_intent(question: str) -> bool:
+    """
+    Check if the question indicates a safety crisis using Gemini.
+    """
+    try:
+        formatted = crisis_detection_prompt.format(question=question)
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        response = model.generate_content(formatted)
+        result = response.text.strip().upper()
+        
+        is_crisis = "CRISIS" in result
+        if is_crisis:
+            print(f"🚨 CRISIS DETECTED: {question}")
+        return is_crisis
+    except Exception as e:
+        print(f"⚠️ Crisis check error: {e}")
+        return False
+
+def check_relevance(question: str, subject: str, current_topic: str, allowed_subtopics: list = []) -> bool:
+    """
+    Check if the question is relevant to the active topic using LLM classification.
+    Fast check using Gemini Flash or GPT-3.5.
+    """
+    # 1. Bypass check for very short greetings or common pleasantries
+    if len(question.strip()) < 5 or question.lower().strip() in ["hello", "hi", "hey", "thanks", "thank you", "bye"]:
+        return True
 
     try:
-        # Get documents with similarity scores using direct Pinecone query
-        # Note: Documents were stored directly to Pinecone, not through LangChain
+        input_variables = {
+            "topic": current_topic if current_topic else subject,
+            "subject": subject,
+            "allowed_subtopics": ", ".join(allowed_subtopics) if allowed_subtopics else "General conceptual understanding",
+            "question": question
+        }
+        
+        formatted = relevance_prompt.format(**input_variables)
+        
+        # Use lighter/faster model for classification
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        response = model.generate_content(formatted)
+        result = response.text.strip().upper()
+        
+        print(f"🛡️ Relevance Check: {result} (Q: {question} | Topic: {current_topic})")
+        return "NOT_RELEVANT" not in result
+
+    except Exception as e:
+        print(f"⚠️ Relevance check failed: {e}. Defaulting to RELEVANT.")
+        return True
+
+def generate_cached_image(topic: str, grade_level: str) -> str:
+    """
+    Check Pinecone cache for an image of 'topic'.
+    If missing, generate with Nano Banana Pro, save locally, and cache URL.
+    Returns relative URL path (e.g. /uploads/image_123.jpg).
+    """
+    import uuid
+    from pinecone import Pinecone
+    import base64
+    
+    topic_key = topic.lower().strip()
+    
+    try:
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        index = pc.Index(PINECONE_INDEX_NAME)
+        embedding = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+        
+        # 1. Check Cache
+        topic_vec = embedding.embed_query(topic_key)
+        
+        query_res = index.query(
+            vector=topic_vec,
+            top_k=1,
+            include_metadata=True,
+            filter={
+                "type": "image_cache",
+                "topic": topic_key
+            }
+        )
+        
+        if query_res.matches and query_res.matches[0].score > 0.95:
+            # Cache Hit!
+            cached_url = query_res.matches[0].metadata.get("image_url")
+            print(f"🍌 Cache Hit for Image: {topic} -> {cached_url}")
+            return cached_url
+            
+        # 2. Generation (Cache Miss)
+        print(f"🍌 Generating new image for: {topic} using Nano Banana Pro...")
+        
+        # User defined prompt structure
+        img_prompt = (
+            f"an image for educational purpose to explain the topic of \"{topic}\". "
+            f"Image should be appropriate for the student of grade \"{grade_level}\" "
+            f"and image should be properly labelled"
+        )
+        
+        model = genai.GenerativeModel('models/nano-banana-pro-preview')
+        response = model.generate_content(img_prompt)
+        
+        image_data = None
+        mime_type = "image/jpeg"
+        
+        if response.parts:
+            for part in response.parts:
+                if part.inline_data:
+                    image_data = part.inline_data.data
+                    mime_type = part.inline_data.mime_type
+                    break
+        
+        if not image_data:
+            print("⚠️ No image data returned from Nano Banana Pro.")
+            return None
+            
+        # 3. Save to Disk
+        ext = ".png" if "png" in mime_type else ".jpg"
+        filename = f"gen_{uuid.uuid4()}{ext}"
+        filepath = os.path.join(STATIC_IMAGE_DIR, filename)
+        
+        with open(filepath, "wb") as f:
+            f.write(image_data)
+            
+        # 4. Upsert to Pinecone Cache
+        # Public URL assumes FastAPI mounts /uploads
+        public_url = f"http://localhost:8000/uploads/{filename}"
+        
+        vector = {
+            "id": f"img_{uuid.uuid4()}",
+            "values": topic_vec,
+            "metadata": {
+                "type": "image_cache",
+                "topic": topic_key,
+                "image_url": public_url,
+                "timestamp": "2025-12-15" 
+            }
+        }
+        
+        index.upsert(vectors=[vector])
+        print(f"🍌 Image generated and cached: {public_url}")
+        return public_url
+        
+    except Exception as e:
+        print(f"❌ Image generation failed: {e}")
+        return None
+
+def answer_question(question: str, history: str, subject: str, student_name: str, grade_level: str, country: str = "Unknown", board: str = "Unknown", mode: str = "tutoring", current_topic: str = "", allowed_subtopics: list = []) -> str:
+    
+    # 🚨 -1. SAFETY FIRST: Check for Crisis
+    if detect_crisis_intent(question):
+        print("🚨 Handling Crisis Response...")
+        try:
+            crisis_formatted = crisis_handling_prompt.format(
+                student_name=student_name,
+                question=question
+            )
+            model = genai.GenerativeModel('gemini-2.0-flash')
+            response = model.generate_content(crisis_formatted)
+            return response.text
+        except Exception as e:
+            print(f"❌ Error generating crisis response: {e}")
+            return "I'm really sorry you're feeling this way. Please reach out to a trusted adult or emergency services immediately. You matter."
+
+    # 0. Check Relevance (Critical Step)
+    if mode == "tutoring" and current_topic:
+        is_relevant = check_relevance(question, subject, current_topic, allowed_subtopics)
+        if not is_relevant:
+            # ✨ GOLDEN REDIRECTION RESPONSE
+            return (
+                f"😊 That’s an interesting question, {student_name}! "
+                f"But right now, let's stay focused on **{current_topic}** so you can master it fully. 🎯\n\n"
+                f"👉 Would you like me to explain more about {current_topic} or try a practice question?"
+            )
+
+    # 0.2 Check for Image Generation Intent
+    if mode == "tutoring" and any(kw in question.lower() for kw in ["show me", "draw", "visualize", "image of", "picture of"]):
+        print(f"🎨 Image request detected: {question}")
+        image_topic = current_topic if current_topic else subject
+        image_url = generate_cached_image(image_topic, grade_level)
+        if image_url:
+            return f"Here is a visualization for **{image_topic}**:\n\n![{image_topic}]({image_url})\n\nIs this helpful?"
+
+    # 0.5 Check Response Cache (if not quiz mode)
+    if mode == "tutoring":
+        cached_response = check_response_cache(question, country, board, grade_level, subject)
+        if cached_response:
+            return cached_response
+    
+    # 1. Setup Retrieval from Pinecone
+    embedding = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+    
+    # 2. Retrieve Context (Direct Pinecone Query)
+    relevant_context = ""
+    try:
         from pinecone import Pinecone
         pc = Pinecone(api_key=PINECONE_API_KEY)
         index = pc.Index(PINECONE_INDEX_NAME)
@@ -128,70 +351,87 @@ def answer_question(question: str, history: str, subject: str, student_name: str
         
         # Filter documents by similarity score threshold
         relevant_docs = []
-        
         for match in query_response.matches:
-            # Convert cosine similarity to percentage (0-1 range)
             similarity_score = (1 + match.score) / 2  # Convert from [-1,1] to [0,1]
-            print(f"📊 Document similarity: {similarity_score:.3f} (threshold: {SIMILARITY_THRESHOLD})")
-            
             if similarity_score >= SIMILARITY_THRESHOLD:
-                # Extract text content from metadata (stored as 'text' key)
                 text_content = match.metadata.get('text', '')
                 if text_content:
                     relevant_docs.append({
                         'content': text_content,
-                        'metadata': match.metadata,
                         'score': similarity_score
                     })
-                    print(f"✅ Document passed threshold: {text_content[:100]}...")
-                else:
-                    print(f"❌ Document has no text content")
-            else:
-                print(f"❌ Document below threshold: {match.metadata.get('text', '')[:100]}...")
         
-        docs_found = len(relevant_docs) > 0
-        print(f"📚 Found {len(relevant_docs)} relevant documents out of {len(query_response.matches)} candidates")
-        
+        if len(relevant_docs) > 0:
+            relevant_context = "\n".join([doc['content'] for doc in relevant_docs])
+            print(f"📖 Using context from {len(relevant_docs)} high-quality documents")
+        else:
+            print("⚠️ No relevant documents found in knowledge base - using general knowledge")
+            
     except Exception as e:
         print(f"Retrieval error: {e}")
-        docs_found = False
-        relevant_docs = []
+        relevant_context = ""
 
-    if docs_found:
-        try:
-            # Use only the high-quality retrieved documents
-            context = "\n".join([doc['content'] for doc in relevant_docs])
-            print(f"📖 Using context from {len(relevant_docs)} high-quality documents")
-            
-            result = chain.invoke({
-                "input": question,
-                "history": history,
-                "context": context
-            })
-            answer = result
-        except Exception as e:
-            print(f"Retrieval chain error: {e}")
-            result = chain.invoke({
-                "input": question,
-                "history": history,
-                "context": ""
-            })
-            answer = result
+    # 3. Construct Prompt
+    if mode == "intro":
+        base_prompt = intro_prompt
+    elif mode == "quiz":
+        base_prompt = quiz_prompt
     else:
-        print("⚠️ No relevant documents found in knowledge base - using general knowledge")
-        result = chain.invoke({
-            "input": question,
-            "history": history,
-            "context": ""
-        })
-        answer = result
+        base_prompt = tutoring_prompt
 
-    text = str(answer.content) if hasattr(answer, "content") else str(answer)
+    # Logic to fill prompt variables
+    input_variables = {
+        "student_name": student_name, 
+        "grade_level": grade_level, 
+        "subject": subject,
+        "input": question,
+        "history": history,
+        "context": relevant_context
+    }
+    
+    # Special handling for quiz prompt which needs 'topic'
+    if mode == "quiz":
+        input_variables["topic"] = current_topic if current_topic else "this topic"
 
-    if not text.strip() or "error" in text.lower():
-        return "🛛 I'm unable to answer that right now. Try rephrasing or ask a different question."
+    formatted_prompt = base_prompt.format(**input_variables)
 
-    return text
+    # 4. Generate Response (Try Gemini First)
+    generated_text = ""
+    try:
+        print("🤖 Attempting generation with Gemini...")
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        response = model.generate_content(formatted_prompt)
+        text = response.text
+        
+        if text:
+            print("✅ Gemini generation successful")
+            generated_text = text
+            
+    except Exception as gemini_err:
+        print(f"❌ Gemini generation failed: {gemini_err}")
+        print("🔄 Falling back to OpenAI...")
+
+    # 5. Fallback to OpenAI
+    if not generated_text:
+        try:
+            llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY, temperature=0.7)
+            # We can just pass the formatted prompt as a single user message to ChatOpenAI
+            # OR re-use the chain logic if we prefer structurally, but passing prompt is simpler here
+            from langchain.schema import HumanMessage
+            messages = [HumanMessage(content=formatted_prompt)]
+            result = llm.invoke(messages)
+            
+            generated_text = str(result.content)
+
+        except Exception as openai_err:
+            print(f"❌ OpenAI generation failed: {openai_err}")
+            return "I apologize, but I am currently unable to process your request. Please try again later."
+
+    # 6. Cache the Response (only in tutoring mode)
+    if mode == "tutoring" and generated_text:
+        cache_response(question, generated_text, country, board, grade_level, subject)
+
+    return generated_text
 
 def suggest_topics_with_ai(subject: str, grade: str, student_name: str = "", student_id: str = "") -> list:
     fallback_topics = {
@@ -353,7 +593,7 @@ Suggestions:
         
         # Parse the suggestions
         suggestions = []
-        for line in raw_suggestions.split('\n'):
+        for line in raw_suggestions.split('\\n'):
             line = line.strip()
             if line and not line.startswith(('Suggestions:', 'Examples:', 'Format')):
                 # Remove any numbering or bullets
@@ -409,6 +649,7 @@ def check_question_similarity(new_question: str, previous_questions: list, simil
         most_similar_question = None
         highest_similarity = 0
         
+
         # Embed previous questions and compare
         for prev_q in previous_questions:
             prev_q_embedding = embedding.embed_query(prev_q.lower())
@@ -452,3 +693,149 @@ def check_question_similarity(new_question: str, previous_questions: list, simil
                             most_similar_question = prev_q
         
         return similar_count > 0, similar_count, most_similar_question
+
+def check_response_cache(question: str, country: str, board: str, grade: str, subject: str) -> str:
+    """
+    Check if a similar question has been answered before for same country/board/grade.
+    Returns cached response if similarity >= 0.92, else None.
+    """
+    try:
+        from pinecone import Pinecone
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        index = pc.Index(PINECONE_INDEX_NAME)
+
+        embedding = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+        question_embedding = embedding.embed_query(question)
+
+        # Query Pinecone for cached responses
+        query_response = index.query(
+            vector=question_embedding,
+            top_k=1,
+            include_metadata=True,
+            filter={
+                "type": "response_cache",
+                "country": country,
+                "board": board,
+                "grade": grade,
+                "subject": subject.lower()
+            }
+        )
+
+        if query_response.matches:
+            match = query_response.matches[0]
+            if match.score >= 0.92:
+                print(f"✅ Found cached response (Score: {match.score:.4f})")
+                return match.metadata.get('response_text')
+            
+    except Exception as e:
+        print(f"⚠️ Cache check failed: {e}")
+    
+    return None
+
+def cache_response(question: str, response: str, country: str, board: str, grade: str, subject: str):
+    """
+    Store question-response pair in Pinecone with metadata for future reuse.
+    """
+    try:
+        if not response or len(response) < 10:
+            return  # Don't cache empty or too short responses
+
+        import uuid
+        from datetime import datetime
+        from pinecone import Pinecone
+        
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        index = pc.Index(PINECONE_INDEX_NAME)
+
+        embedding = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+        question_embedding = embedding.embed_query(question)
+
+        vector = {
+            "id": f"cache_{str(uuid.uuid4())}",
+            "values": question_embedding,
+            "metadata": {
+                "type": "response_cache",
+                "country": country,
+                "board": board,
+                "grade": grade,
+                "subject": subject.lower(),
+                "question_text": question,
+                "response_text": response,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        }
+
+        index.upsert(vectors=[vector])
+        print("💾 Response cached for future use")
+
+    except Exception as e:
+        print(f"⚠️ Failed to cache response: {e}")
+
+
+def retrieve_quiz_context(chapter_title: str, topics: list, subject: str) -> str:
+    """
+    Retrieve relevant context from the vector DB for quiz generation.
+    Specifically looks for:
+    1. Chapter summary/content (using chapter title and topics).
+    2. Past papers or exam questions related to the chapter.
+    """
+    context_parts = []
+    
+    try:
+        from pinecone import Pinecone
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        index = pc.Index(PINECONE_INDEX_NAME)
+        embedding = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+
+        # 1. Search for General Chapter Content
+        # Combine title and top 3 topics for a good search query
+        query_text = f"{chapter_title} {' '.join(topics[:3])} summary concepts"
+        query_vec = embedding.embed_query(query_text)
+        
+        content_results = index.query(
+            vector=query_vec,
+            top_k=5,
+            include_metadata=True,
+            filter={"subject": subject.capitalize()}
+        )
+        
+        chapter_content = []
+        for match in content_results.matches:
+            if match.score > 0.75: # Only high relevance
+                 chapter_content.append(match.metadata.get('text', ''))
+        
+        if chapter_content:
+            context_parts.append("--- TEXTBOOK CONTENT ---")
+            context_parts.extend(chapter_content)
+
+        # 2. Search SPECIFICALLY for Past Papers / Exams
+        # We assume past papers might be tagged or contain keywords like "Past Paper", "Exam", "Questions"
+        past_paper_query = f"{chapter_title} past paper exam questions"
+        pp_vec = embedding.embed_query(past_paper_query)
+        
+        pp_results = index.query(
+            vector=pp_vec,
+            top_k=5,
+            include_metadata=True,
+            filter={
+                "subject": subject.capitalize(),
+                # We optionally filter if we have a type field, but text search is broad
+            }
+        )
+        
+        past_papers = []
+        for match in pp_results.matches:
+            text = match.metadata.get('text', '')
+            # Simple keyword check to boost confidence it's a question bank
+            if any(k in text.lower() for k in ["question", "mark", "exam", "paper", "(a)", "(b)"]):
+                past_papers.append(text)
+        
+        if past_papers:
+            print(f"📄 Found {len(past_papers)} potential past paper fragments for {chapter_title}")
+            context_parts.append("\\n--- PAST PAPER QUESTIONS (PRIORITIZE THESE) ---")
+            context_parts.extend(past_papers)
+            
+    except Exception as e:
+        print(f"❌ Error retrieving quiz context: {e}")
+        
+    return "\\n\\n".join(context_parts)
