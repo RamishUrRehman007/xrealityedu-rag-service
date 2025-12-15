@@ -23,8 +23,14 @@ if not os.path.exists(STATIC_IMAGE_DIR):
     os.makedirs(STATIC_IMAGE_DIR)
 
 intro_prompt = PromptTemplate.from_template("""
-You are XRTutor, a super friendly and enthusiastic AI study buddy! 🌟 
+You are XRTutor, a super friendly and enthusiastic AI study buddy for XReality Education! 🌟 
 You are here to help {student_name}, a {grade_level} student, master **{subject}**.
+
+🔒 CRITICAL RULES (NON-NEGOTIABLE):
+1. You MUST answer ONLY using the provided textbook context below.
+2. If the answer is NOT in the context, say: "This topic is not covered in your current textbook."
+3. ALWAYS cite your source: "📖 Source: [Chapter/Topic Name]"
+4. Do NOT use outside knowledge.
 
 Your Goal:
 - Be warm, encouraging, and fun!
@@ -50,11 +56,19 @@ Answer:
 """)
 
 tutoring_prompt = PromptTemplate.from_template("""
-You are XRTutor, an awesome AI tutor helping {student_name} ({grade_level}) learn **{subject}**.
+You are XRTutor, an AI tutor for XReality Education helping {student_name} ({grade_level}) learn **{subject}**.
+
+🔒 CRITICAL RULES (NON-NEGOTIABLE):
+1. You MUST answer ONLY using the provided textbook context below.
+2. If the answer is NOT found in the context, respond EXACTLY: "This topic is not covered in your current textbook. Would you like me to suggest related topics we can explore?"
+3. ALWAYS cite your source at the end of your answer using this format: "📖 Source: [Chapter/Topic Name]"
+4. Do NOT use outside knowledge or information not in the context.
+5. Do NOT guess or add examples beyond what's in the textbook.
+6. Keep explanations simple and age-appropriate for {grade_level}.
 
 Your Style:
 - Use simple, everyday language. 🗣️
-- Use RELATABLE EXAMPLES (e.g., sports, video games, cars, nature) to explain complex ideas.
+- Use RELATABLE EXAMPLES from the textbook to explain complex ideas.
 - If the student seems stuck, say: "Don't worry, we'll get this! Let's break it down." 🧱
 - Keep it concise but helpful.
 
@@ -70,6 +84,7 @@ Answer:
 **Formatting Rule**:
 - ALWAYS use Unicode scientific notation for numbers (e.g., Use 6.67 × 10⁻¹¹ instead of 6.67 x 10^-11).
 - Use proper symbols for units (e.g., N·m²/kg² instead of N m^2/kg^2).
+- END with citation: 📖 Source: [Chapter/Topic Name]
 """)
 
 quiz_prompt = PromptTemplate.from_template("""
@@ -329,8 +344,10 @@ def answer_question(question: str, history: str, subject: str, student_name: str
     # 1. Setup Retrieval from Pinecone
     embedding = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
     
-    # 2. Retrieve Context (Direct Pinecone Query)
+    # 2. Retrieve Context (Direct Pinecone Query with Multi-Level Filtering)
     relevant_context = ""
+    retrieved_sources = []  # Track sources for citation
+    
     try:
         from pinecone import Pinecone
         pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -339,14 +356,34 @@ def answer_question(question: str, history: str, subject: str, student_name: str
         # Generate embedding for the question
         question_embedding = embedding.embed_query(question)
         
-        # Query Pinecone directly
+        # 🎯 Build multi-level filter for curriculum alignment
+        search_filter = {
+            "subject": subject.capitalize()  # Match 'Physics', 'Math', etc.
+        }
+        
+        # Add grade-level filter if available
+        if grade_level and grade_level.lower() not in ['unknown', 'none', '']:
+            search_filter["grade"] = grade_level
+            print(f"🎓 Filtering by grade: {grade_level}")
+        
+        # Add board filter if available
+        if board and board.lower() not in ['unknown', 'none', '']:
+            search_filter["board"] = board
+            print(f"📚 Filtering by board: {board}")
+        
+        # Add country filter if available
+        if country and country.lower() not in ['unknown', 'none', '']:
+            search_filter["country"] = country
+            print(f"🌍 Filtering by country: {country}")
+        
+        print(f"🔍 Search filter: {search_filter}")
+        
+        # Query Pinecone directly with enhanced filtering
         query_response = index.query(
             vector=question_embedding,
             top_k=MAX_RETRIEVAL_CANDIDATES,
             include_metadata=True,
-            filter={
-                "subject": subject.capitalize()  # Match 'Physics', 'Math', etc.
-            }
+            filter=search_filter
         )
         
         # Filter documents by similarity score threshold
@@ -356,16 +393,34 @@ def answer_question(question: str, history: str, subject: str, student_name: str
             if similarity_score >= SIMILARITY_THRESHOLD:
                 text_content = match.metadata.get('text', '')
                 if text_content:
+                    # Extract source information for citation
+                    source_info = {
+                        'chapter': match.metadata.get('chapter', 'Unknown Chapter'),
+                        'topic': match.metadata.get('topic', ''),
+                        'page': match.metadata.get('page', ''),
+                        'score': similarity_score
+                    }
+                    retrieved_sources.append(source_info)
+                    
                     relevant_docs.append({
                         'content': text_content,
-                        'score': similarity_score
+                        'score': similarity_score,
+                        'source': source_info
                     })
         
         if len(relevant_docs) > 0:
             relevant_context = "\n".join([doc['content'] for doc in relevant_docs])
-            print(f"📖 Using context from {len(relevant_docs)} high-quality documents")
+            print(f"📖 Using context from {len(relevant_docs)} high-quality documents (Grade: {grade_level}, Board: {board})")
         else:
-            print("⚠️ No relevant documents found in knowledge base - using general knowledge")
+            print(f"⚠️ No relevant documents found in knowledge base for {subject} (Grade: {grade_level}, Board: {board})")
+            # Return early with "not in textbook" message
+            return (
+                f"I apologize, {student_name}, but I couldn't find information about this topic in your current {subject} textbook "
+                f"for {grade_level} ({board} curriculum). 📚\n\n"
+                f"Would you like me to:\n"
+                f"1. Suggest related topics we can explore?\n"
+                f"2. Help you with a different {subject} question?"
+            )
             
     except Exception as e:
         print(f"Retrieval error: {e}")
@@ -427,7 +482,22 @@ def answer_question(question: str, history: str, subject: str, student_name: str
             print(f"❌ OpenAI generation failed: {openai_err}")
             return "I apologize, but I am currently unable to process your request. Please try again later."
 
-    # 6. Cache the Response (only in tutoring mode)
+    # 6. Add citation if not already present
+    if mode == "tutoring" and generated_text and retrieved_sources:
+        # Check if response already has a citation
+        if "📖 Source:" not in generated_text and "Source:" not in generated_text:
+            # Add citation from the highest-scoring source
+            best_source = retrieved_sources[0]
+            citation = f"\n\n📖 Source: {best_source['chapter']}"
+            if best_source['topic']:
+                citation += f" - {best_source['topic']}"
+            if best_source['page']:
+                citation += f" (Page {best_source['page']})"
+            
+            generated_text += citation
+            print(f"✅ Added citation: {citation.strip()}")
+
+    # 7. Cache the Response (only in tutoring mode)
     if mode == "tutoring" and generated_text:
         cache_response(question, generated_text, country, board, grade_level, subject)
 
