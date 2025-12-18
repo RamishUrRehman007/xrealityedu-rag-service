@@ -1,0 +1,90 @@
+INFO:     Will watch for changes in these directories: ['/Users/syedhashmi/Xreality-New Repo/Rag Services/xrealityedu-rag-service']
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [71062] using StatReload
+/Users/syedhashmi/Xreality-New Repo/Rag Services/xrealityedu-rag-service/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+/Users/syedhashmi/Xreality-New Repo/Rag Services/xrealityedu-rag-service/.venv/lib/python3.9/site-packages/google/api_core/_python_version_support.py:252: FutureWarning: You are using a Python version (3.9.6) past its end of life. Google will update google.api_core with critical bug fixes on a best-effort basis, but not with any other fixes or features. Please upgrade to the latest Python version, or at least Python 3.10, and then update google.api_core.
+  warnings.warn(message, FutureWarning)
+INFO:     Started server process [71064]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+WARNING:  StatReload detected changes in 'verify_image_function.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [71064]
+/Users/syedhashmi/Xreality-New Repo/Rag Services/xrealityedu-rag-service/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+/Users/syedhashmi/Xreality-New Repo/Rag Services/xrealityedu-rag-service/.venv/lib/python3.9/site-packages/google/api_core/_python_version_support.py:252: FutureWarning: You are using a Python version (3.9.6) past its end of life. Google will update google.api_core with critical bug fixes on a best-effort basis, but not with any other fixes or features. Please upgrade to the latest Python version, or at least Python 3.10, and then update google.api_core.
+  warnings.warn(message, FutureWarning)
+INFO:     Started server process [71077]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+WARNING:  StatReload detected changes in 'verify_image_function.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [71077]
+/Users/syedhashmi/Xreality-New Repo/Rag Services/xrealityedu-rag-service/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+/Users/syedhashmi/Xreality-New Repo/Rag Services/xrealityedu-rag-service/.venv/lib/python3.9/site-packages/google/api_core/_python_version_support.py:252: FutureWarning: You are using a Python version (3.9.6) past its end of life. Google will update google.api_core with critical bug fixes on a best-effort basis, but not with any other fixes or features. Please upgrade to the latest Python version, or at least Python 3.10, and then update google.api_core.
+  warnings.warn(message, FutureWarning)
+INFO:     Started server process [71089]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     127.0.0.1:60150 - "WebSocket /wss/qa_chat/Physics_9e411893-1768-4d24-a732-58f1b80a7555_Grade-10" [accepted]
+⏱️ Starting study timer for: 9e411893-1768-4d24-a732-58f1b80a7555 (Connected)
+INFO:     connection open
+INFO:     127.0.0.1:60152 - "WebSocket /wss/qa_chat/Physics_9e411893-1768-4d24-a732-58f1b80a7555_Grade-10" [accepted]
+⏱️ Starting study timer for: 9e411893-1768-4d24-a732-58f1b80a7555 (Connected)
+INFO:     connection open
+🔴 Disconnected from room: Physics_9e411893-1768-4d24-a732-58f1b80a7555_Grade-10
+🛑 Stopped study timer for: 9e411893-1768-4d24-a732-58f1b80a7555 (Disconnected)
+INFO:     connection closed
+[Physics_9e411893-1768-4d24-a732-58f1b80a7555_Grade-10] 9e411893-1768-4d24-a732-58f1b80a7555 says: Hi
+🎓 Student: Saim | Grade: Grade-10 | Subject: Physics
+📚 Retrieved 9 chat history entries for 9e411893-1768-4d24-a732-58f1b80a7555 in Physics
+[Physics_9e411893-1768-4d24-a732-58f1b80a7555_Grade-10] 9e411893-1768-4d24-a732-58f1b80a7555 says: Who was Michael Jackson
+🎓 Student: Saim | Grade: Grade-10 | Subject: Physics
+🛡️ Relevance Check: NOT_RELEVANT (Q: Who was Michael Jackson | Topic: Physics)
+🔴 Disconnected from room: Physics_9e411893-1768-4d24-a732-58f1b80a7555_Grade-10
+🧠 Saving chat history for: Physics_9e411893-1768-4d24-a732-58f1b80a7555_Grade-10
+📦 Chat stored to Pinecone: {'status': 'embedding failed', 'error': 'Error code: 400 - {\'error\': {\'message\': "This model\'s maximum context length is 8192 tokens, however you requested 17310 tokens (17310 in your prompt; 0 for the completion). Please reduce your prompt; or completion length.", \'type\': \'invalid_request_error\', \'param\': None, \'code\': None}}'}
+🛑 Stopped study timer for: 9e411893-1768-4d24-a732-58f1b80a7555 (Disconnected)
+INFO:     connection closed
+WARNING:  StatReload detected changes in 'main.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [71089]
+/Users/syedhashmi/Xreality-New Repo/Rag Services/xrealityedu-rag-service/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+/Users/syedhashmi/Xreality-New Repo/Rag Services/xrealityedu-rag-service/.venv/lib/python3.9/site-packages/google/api_core/_python_version_support.py:252: FutureWarning: You are using a Python version (3.9.6) past its end of life. Google will update google.api_core with critical bug fixes on a best-effort basis, but not with any other fixes or features. Please upgrade to the latest Python version, or at least Python 3.10, and then update google.api_core.
+  warnings.warn(message, FutureWarning)
+INFO:     Started server process [72481]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+WARNING:  StatReload detected changes in 'main.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [72481]
+/Users/syedhashmi/Xreality-New Repo/Rag Services/xrealityedu-rag-service/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+/Users/syedhashmi/Xreality-New Repo/Rag Services/xrealityedu-rag-service/.venv/lib/python3.9/site-packages/google/api_core/_python_version_support.py:252: FutureWarning: You are using a Python version (3.9.6) past its end of life. Google will update google.api_core with critical bug fixes on a best-effort basis, but not with any other fixes or features. Please upgrade to the latest Python version, or at least Python 3.10, and then update google.api_core.
+  warnings.warn(message, FutureWarning)
+INFO:     Started server process [73995]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+WARNING:  StatReload detected changes in 'main.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [73995]
+/Users/syedhashmi/Xreality-New Repo/Rag Services/xrealityedu-rag-service/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+/Users/syedhashmi/Xreality-New Repo/Rag Services/xrealityedu-rag-service/.venv/lib/python3.9/site-packages/google/api_core/_python_version_support.py:252: FutureWarning: You are using a Python version (3.9.6) past its end of life. Google will update google.api_core with critical bug fixes on a best-effort basis, but not with any other fixes or features. Please upgrade to the latest Python version, or at least Python 3.10, and then update google.api_core.
+  warnings.warn(message, FutureWarning)
+INFO:     Started server process [74017]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.

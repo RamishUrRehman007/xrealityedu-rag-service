@@ -19,9 +19,14 @@ import re
 import os
 from functools import partial
 from dotenv import load_dotenv
+import time # ✅ Added time
+import requests # ✅ Added requests
+import random # For lesson runner
+import traceback # For error logging
 import retrieve_and_respond
+from teaching_pack import generate_teaching_pack
 
-from retrieve_and_respond import answer_question, get_user_chat_history, suggest_topics_with_ai, generate_prompt_suggestions, check_question_similarity
+from retrieve_and_respond import answer_question, get_user_chat_history, suggest_topics_with_ai, generate_prompt_suggestions, check_question_similarity, handle_chip_click
 from store_chat_to_pinecone import store_chat_to_pinecone
 from embed import embed_pdf
 
@@ -59,6 +64,7 @@ question_history: Dict[str, List[str]] = {}  # Track questions per room for repe
 
 # Backend API URL for progress updates
 BACKEND_API_URL = os.getenv("BACKEND_API_URL", "http://localhost:5001/api")
+ALERT_THROTTLE_SECONDS = int(os.getenv("ALERT_THROTTLE_SECONDS", "1800"))
 
 # Track last heartbeat time per user to avoid spamming
 last_heartbeat: Dict[str, float] = {}
@@ -160,6 +166,259 @@ def update_chapter_progress(user_id: str, subject: str, topic_title: str = None,
     
     # Run in background thread
     threading.Thread(target=_do_update, daemon=True).start()
+
+def fetch_teaching_pack(subject: str, chapter_title: str) -> dict:
+    """
+    Fetch Teaching Pack JSON from Node.js Backend.
+    """
+    try:
+        import requests
+        # Filter is tricky if we don't have chapterId. Try subject+title.
+        # Ensure encoding is handled
+        url = f"{BACKEND_API_URL}/internal/chapters-teaching-pack"
+        params = {
+            "subject": subject,
+            "chapterTitle": chapter_title
+        }
+        print(f"📦 Fetching Teaching Pack: {subject} - {chapter_title}...")
+        resp = requests.get(url, params=params, timeout=5)
+        
+        if resp.status_code == 200:
+            pack = resp.json()
+            # print(f"✅ Teaching Pack Loaded: {pack.keys()}")
+            return pack
+        else:
+            print(f"⚠️ Teaching Pack fetch failed: {resp.status_code}")
+            return None
+    except Exception as e:
+        print(f"⚠️ Error fetching Teaching Pack: {e}")
+        return None
+
+
+# ============================================================================
+# HELPER FUNCTIONS: Crisis, Pack Fetching, Chapter Resolution, Lesson Runner
+# ============================================================================
+
+def detect_self_harm_strong(text: str) -> bool:
+    t = (text or "").lower()
+    return any(x in t for x in [
+        "suicide","kill myself","i want to die","self harm","self-harm","hurt myself","end my life"
+    ])
+
+def trigger_parent_alert_via_node(user_id: str, message: str, subject: str):
+    try:
+        requests.post(
+            f"{BACKEND_API_URL}/internal/alerts/parent-crisis",
+            json={"studentUserId": user_id, "message": message, "subject": subject},
+            timeout=3
+        )
+        print(f"🚨 SENT PARENT ALERT for user {user_id}")
+    except Exception as e:
+        print(f"❌ Parent alert failed: {e}")
+
+def fetch_teaching_pack_by_chapter_id(chapter_id: str) -> dict:
+    try:
+        url = f"{BACKEND_API_URL}/internal/teaching-pack/by-chapter/{chapter_id}"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            return resp.json().get("teachingPack")
+        return None
+    except Exception as e:
+        print(f"⚠️ Error fetching teaching pack by chapterId: {e}")
+        return None
+
+def resolve_chapter_for_topic(curriculum_topics: list, chosen_topic_text: str):
+    ct = (chosen_topic_text or "").lower().strip()
+    for ch in curriculum_topics or []:
+        ch_id = ch.get("chapterId") or ch.get("id")  # support either
+        ch_title = ch.get("chapterTitle", "")
+
+        for t in ch.get("topics", []) or []:
+            t_title = t.get("topicTitle", "") if isinstance(t, dict) else str(t)
+            if t_title.lower().strip() == ct:
+                return (ch_id, ch_title)
+
+    return (None, None)
+
+async def run_teacher_led_step(websocket: WebSocket, state: Dict, payload: Dict):
+    """
+    Execute one step of the Teacher-Led Lesson Engine.
+    Steps: Teach -> Check -> Practice -> Next Concept
+    """
+    # Local import to avoid circular dependency risks
+    from retrieve_and_respond import judge_mastery, answer_question 
+
+    try:
+        lesson = state["lesson"]
+        pack = state.get("teacher_pack", {})
+        concepts = pack.get("concepts", [])
+        
+        if not concepts or lesson["step_index"] >= len(concepts):
+            # Lesson Complete
+            lesson["active"] = False
+            await websocket.send_json({
+                "message": "🎉 You’ve completed all the core concepts in this chapter! Great job using the Teacher-Led mode.",
+                "user_id": "AI_TUTOR"
+            })
+            state["step"] = "awaiting_topic" # Return to menu
+            return
+
+        current_concept = concepts[lesson["step_index"]]
+        phase = lesson["phase"]
+        
+        # Build Teacher Pack Snippet for Context
+        tp_snippet = (
+            f"Current Chapter: {pack.get('chapterId', '')}\n"
+            f"Concept Title: {current_concept.get('title', '')}\n"
+            f"Key Content: {current_concept.get('content', '')}\n"
+            f"Objectives: {current_concept.get('objectives', '')}\n"
+        )
+
+        user_msg = payload.get("message", "") # Student's input
+
+        # 1. TEACH PHASE
+        if phase == "teach":
+            # Just deliver the content (via answer_question for consistency + personality)
+            prompt = f"Teach this concept: {current_concept.get('title')}. Content: {current_concept.get('content')}"
+            
+            response = answer_question(
+                question=prompt,
+                history="",
+                subject=state.get("subject", "General"),
+                student_name=state.get("student_name", "Student"),
+                grade_level=state.get("grade_level", "Unknown"),
+                teacher_pack_snippet=tp_snippet
+            )
+            
+            # Ask the check question immediately after teaching
+            check_q = current_concept.get("check_understanding", "Does that make sense?")
+            full_resp = f"{response}\n\n**Check:** {check_q}"
+            
+            await websocket.send_json({
+                "message": full_resp,
+                "user_id": "AI_TUTOR"
+            })
+            
+            # Move to CHECK phase to await answer
+            lesson["phase"] = "check"
+            return
+
+        # 2. CHECK PHASE
+        elif phase == "check":
+            # Judge the student's answer
+            judgment = judge_mastery(
+                student_answer=user_msg,
+                teach_snippet=tp_snippet,
+                context="" 
+            )
+            
+            result = judgment.get("result", "PASS")
+            
+            if result == "PASS":
+                # Mark topic covered
+                if lesson.get("topic_title"):
+                     state["covered_topics"].append(lesson["topic_title"])
+
+                await websocket.send_json({
+                    "message": f"✅ Correct! {judgment.get('reason', 'Good understanding.')}\n\nLet's try a quick practice question to lock it in.",
+                    "user_id": "AI_TUTOR"
+                })
+                # Move to PRACTICE
+                lesson["phase"] = "practice"
+                
+                # Send practice question NOW
+                p_q = current_concept.get("practice_question")
+                if p_q:
+                    await websocket.send_json({
+                        "message": f"**Practice:** {p_q}\n(Type your answer)",
+                        "user_id": "AI_TUTOR"
+                    })
+                else:
+                    lesson["phase"] = "teach"
+                    lesson["step_index"] += 1
+                    await websocket.send_json({
+                        "message": "Ready for the next concept? (Type 'Ready')",
+                        "user_id": "AI_TUTOR"
+                    })
+                return
+
+            else:
+                # FAIL -> Reteach / Hint
+                await websocket.send_json({
+                    "message": f"🤔 Not quite. {judgment.get('fix', 'Let me explain again.')}\n\n**Try again:** {judgment.get('followup_question', 'What do you think?')}",
+                    "user_id": "AI_TUTOR"
+                })
+                lesson["attempts"] += 1
+                # Stay in check phase
+                return
+
+        # 3. PRACTICE PHASE
+        elif phase == "practice":
+            # Simple check for practice
+            await websocket.send_json({
+                "message": f"Good effort! 🌟\n\nReady for the next concept? (Type 'Ready')",
+                "user_id": "AI_TUTOR"
+            })
+            lesson["step_index"] += 1
+            lesson["phase"] = "teach"
+            return
+
+    except Exception as e:
+        print(f"❌ Lesson Runner Error: {e}")
+        traceback.print_exc()
+        state["mode"] = "tutoring"
+        lesson["active"] = False
+
+def resolve_topic_id_via_api(subject: str, chapter_title: str, topic_title: str) -> dict:
+    """
+    Resolve legacy string-based topic to standard UUID via Backend API.
+    Returns dict { topicId, topicTitle, chapterId } or None.
+    """
+    try:
+        import requests
+        url = f"{BACKEND_API_URL}/internal/chapter-topic/resolve-id"
+        params = {
+            "subject": subject,
+            "chapterTitle": chapter_title,
+            "topicTitle": topic_title
+        }
+        # print(f"🔍 Resolving Legacy Topic: {topic_title}...")
+        resp = requests.get(url, params=params, timeout=3)
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            # print(f"✅ Resolved: {data.get('topicId')}")
+            return data
+        else:
+            print(f"⚠️ Resolution failed: {resp.status_code} - {resp.text}")
+            return None
+    except Exception as e:
+        print(f"⚠️ Error resolving topic: {e}")
+        return None
+
+def fetch_chapter_progress(user_id: str) -> set:
+    """
+    Fetch completed topic IDs for the student from Node.js Backend.
+    Returns a set of topic IDs.
+    """
+    try:
+        import requests
+        url = f"{BACKEND_API_URL}/internal/progress/student"
+        params = {"userId": user_id}
+        # print(f"📊 Fetching student progress...")
+        resp = requests.get(url, params=params, timeout=3)
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            topics = data.get("topicsCompleted", [])
+            # print(f"✅ Progress Loaded: {len(topics)} topics completed")
+            return set(topics)
+        else:
+            print(f"⚠️ Progress fetch failed: {resp.status_code}")
+            return set()
+    except Exception as e:
+        print(f"⚠️ Error fetching progress: {e}")
+        return set()
 
 def save_quiz_result(user_id: str, subject: str, quiz_type: str, 
                      total_questions: int, correct_answers: int,
@@ -401,7 +660,35 @@ def get_next_curriculum_topics(state: Dict, subject: str, count: int = 3) -> tup
     # Return next topics (up to count)
     return (uncovered[:count], False)
 
-@app.websocket("/wss/qa_chat/{room_id}")
+def get_allowed_topic_ids(state: Dict, quiz_type: str) -> set:
+    """
+    Determine allowed topic IDs based on quiz type.
+    THE QUIZ GATE.
+    """
+    # 🚨 STRICT LEGACY CHECK
+    if state.get("topic_id_mode") == "legacy" and not state.get("current_topic_id"):
+        # If we are in legacy mode and failed to resolve an ID, BLOCK ALL QUIIZES.
+        # Exception: Final Quiz might work if we strictly use "topics_completed" from DB (which are IDs).
+        # But for Contextual/Chip quizzes which rely on "current" context, we must block.
+        if quiz_type == "final":
+             return state.get("topics_completed", set())
+        return set()
+
+    if quiz_type == "contextual":
+        # Only the current active topic
+        return {state["current_topic_id"]} if state.get("current_topic_id") else set()
+
+    if quiz_type == "chip":
+        # Only completed topics
+        return state.get("topics_completed", set())
+
+    if quiz_type == "final":
+        # Only completed topics (server-side check should enforce *all* chapter topics are here)
+        return state.get("topics_completed", set())
+
+    return set()
+
+@app.websocket("/ws/qa_chat/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str):
     await websocket.accept()
     
@@ -423,16 +710,48 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
         chat_logs[room_id] = []
     if room_id not in welcome_sent:
         welcome_sent[room_id] = False
-    if room_id not in tutor_state:
-        tutor_state[room_id] = {
-            "step": "awaiting_topic",
-            "topic": None,
-            "level": None,
-            "prior_knowledge": None,
-            "quiz_permission": False,
-            "interaction_count": 0,
-            "last_quiz_offer": 0
-        }
+        if room_id not in tutor_state:
+            tutor_state[room_id] = {
+                "step": "awaiting_topic",
+                "topic": None,
+                "level": None,
+                "prior_knowledge": None,
+                "quiz_permission": False,
+                "interaction_count": 0,
+                "last_quiz_offer": 0,
+
+                # curriculum + progress
+                "curriculum_topics": [],
+                "covered_topics": [],
+                "topics_completed": set(),
+
+                # topic id control
+                "current_topic_id": None,
+                "current_topic_title": None,
+                "topic_id_mode": "legacy",
+
+                # teaching pack
+                "teacher_pack": None,
+
+                # safety + alerts
+                "mode": "tutoring",
+                "had_safety_event": False,
+                "last_parent_alert_at": 0,
+
+                # lesson engine (teacher-led)
+                "lesson": {
+                    "active": False,
+                    "phase": "teach",          # teach -> check -> practice
+                    "chapter_id": None,
+                    "chapter_title": None,
+                    "topic_title": None,
+                    "step_index": 0,
+                    "attempts": 0,
+                    "daily_practice_limit": 1,
+                    "practice_done_today": 0,
+                    "last_practice_date": None
+                }
+            }
     if room_id not in question_history:
         question_history[room_id] = []
 
@@ -443,15 +762,41 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             raw_data = await websocket.receive_text()
             payload = json.loads(raw_data)
 
-            user_message = payload["message"].strip()
+            user_message = payload.get("message", "").strip()
             user_id = payload["user_id"]
             student_name = payload["student_name"]
             grade = payload["grade"]
             subject = payload["subject"]
             curriculum_topics = payload.get("curriculum_topics", [])  # New: get curriculum topics
+            msg_type = payload.get("type", "message")
 
-            print(f"[{room_id}] {user_id} says: {user_message}")
-            print(f"🎓 Student: {student_name} | Grade: {grade} | Subject: {subject}")
+            if msg_type != "init":
+                print(f"[{room_id}] {user_id} says: {user_message}")
+                print(f"🎓 Student: {student_name} | Grade: {grade} | Subject: {subject}")
+            
+            # 🚨 0. CRISIS GATE: Detect Self-Harm & Alert
+            if msg_type != "init" and detect_self_harm_strong(user_message):
+                state = tutor_state[room_id]
+                state["mode"] = "safety"
+                state["lesson"]["active"] = False
+
+                await websocket.send_json({
+                    "message": (
+                        f"Hey {student_name} — I’m really glad you told me.\n\n"
+                        "I can’t continue the lesson right now because your safety matters most.\n"
+                        "Please reach out to a parent/guardian or trusted adult immediately.\n\n"
+                        "Are you safe right now? (yes/no)"
+                    ),
+                    "user_id": "AI_TUTOR",
+                    "type": "safety"
+                })
+
+                now = time.time()
+                if now - state.get("last_parent_alert_at", 0) >= ALERT_THROTTLE_SECONDS:
+                    state["last_parent_alert_at"] = now
+                    trigger_parent_alert_via_node(user_id, user_message, subject)
+
+                continue
             
             # Send study heartbeat to track time for streak
             send_study_heartbeat(user_id)
@@ -473,7 +818,11 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     "interaction_count": 0,
                     "last_quiz_offer": 0,
                     "curriculum_topics": [],
-                    "covered_topics": []
+                    "covered_topics": [],
+                    "teacher_pack": None,  # Store teaching pack here
+                    "current_topic_id": None,     # ✅ NEW
+                    "current_topic_title": None,  # ✅ NEW
+                    "topics_completed": set()     # ✅ NEW
                 }
             if room_id not in question_history:
                 question_history[room_id] = []
@@ -533,7 +882,113 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 continue
 
             # Tutor state logic
-            if state["step"] == "awaiting_topic":
+            if state["step"] == "awaiting_topic" and msg_type != "init":
+                state["topic"] = user_message
+                
+                # 🚀 FETCH TEACHING PACK HERE (if not already loaded or if simplified flow)
+                # Ideally we want it at room init if we knew the chapter. 
+                # But topic selection is often where we narrow down.
+                # Actually, the user selects a "Chapter" in UI, but writes a "Topic". 
+                # Let's try to fetch if we have curriculum info.
+                
+                # Try to find which chapter this topic belongs to from curriculum_topics
+                chapter_for_pack = subject # Default
+                
+                # ✅ NEW: Reset current topic ID/Title
+                state["current_topic_title"] = user_message
+                state["current_topic_id"] = None
+                state["topic_id_mode"] = "legacy" # Assume legacy until proven otherwise
+
+                # Resolve Chapter ID & Topic Model
+                chapter_for_pack = subject # fallback
+                
+                if state.get("curriculum_topics"):
+                    # user_message is the topic title
+                    for ch in state["curriculum_topics"]:
+                         for t in ch.get("topics", []):
+                            # Handle both object (new) and string (old) formats
+                            t_title = t.get("topicTitle", "") if isinstance(t, dict) else t
+                            if t_title.lower() == user_message.lower():
+                                chapter_for_pack = ch.get("chapterTitle", subject)
+                                if isinstance(t, dict) and "topicId" in t:
+                                    state["current_topic_id"] = t["topicId"] # ✅ Capture ID
+                                    state["topic_id_mode"] = "id"           # ✅ Mode: ID
+                                break
+                
+                # 🚑 SELF-HEALING: If Legacy Mode (No ID found), attempt backend resolution
+                if state["topic_id_mode"] == "legacy" and not state["current_topic_id"]:
+                    print(f"🩹 Attempting self-healing for topic: {user_message}")
+                    loop = asyncio.get_event_loop()
+                    resolved = await loop.run_in_executor(
+                        None, 
+                        resolve_topic_id_via_api, 
+                        subject, 
+                        chapter_for_pack, 
+                        user_message
+                    )
+                    if resolved and resolved.get("topicId"):
+                        state["current_topic_id"] = resolved["topicId"]
+                        state["topic_id_mode"] = "id"
+                        print(f"✅ Self-healed session! Switched to ID mode: {state['current_topic_id']}")
+                    else:
+                        print("⚠️ Self-healing failed. Quiz capabilities limited.")
+
+                # ✅ NEW: Fetch Teaching Pack by Chapter ID (if available from curriculum or resolve)
+                # Resolve chapter info for pack fetching
+                chap_id, chap_title = resolve_chapter_for_topic(state.get("curriculum_topics", []), user_message)
+                
+                if chap_id:
+                     print(f"📦 Found Chapter ID: {chap_id}, fetching pack...")
+                     loop = asyncio.get_event_loop()
+                     pack = await loop.run_in_executor(None, fetch_teaching_pack_by_chapter_id, chap_id)
+                     if pack:
+                         state["teacher_pack"] = pack
+                         state["lesson"]["chapter_id"] = chap_id
+                         state["lesson"]["chapter_title"] = chap_title or subject
+                         print("✅ Teaching Pack Loaded via Chapter ID!")
+                     else:
+                         print("⚠️ Failed to load pack via Chapter ID, falling back to legacy flow if needed.")
+                else:
+                    print("⚠️ Could not resolve Chapter ID from provided curriculum.")
+
+                # ✅ Sync DB Progress
+                loop = asyncio.get_event_loop()
+                completed_set = await loop.run_in_executor(None, fetch_chapter_progress, user_id)
+                state["topics_completed"] = completed_set
+                
+                # 👋 START LESSON IMMEDIATELY (B5)
+                if state.get("teacher_pack"):
+                    state["lesson"]["active"] = True
+                    state["lesson"]["phase"] = "teach"
+                    state["lesson"]["topic_title"] = user_message
+                    state["lesson"]["step_index"] = 0
+                    state["lesson"]["attempts"] = 0
+                    state["step"] = "tutoring" # Skip awaiting_prior_knowledge
+
+                    await websocket.send_json({
+                        "message": f"Perfect. I’ll teach **{state['lesson']['chapter_title']}** step-by-step (teach → check → practice). Let’s begin.",
+                        "user_id": "AI_TUTOR"
+                    })
+                    # ✅ run the teacher-led engine instead of free chat
+                    await run_teacher_led_step(websocket, state, payload)
+                    continue
+                else:
+                    # Fallback to old flow if no pack
+                    state["step"] = "awaiting_prior_knowledge"
+                    await websocket.send_json({
+                        "message": f"Great! We'll focus on **{state['topic']}**. How familiar are you with this topic? (Beginner, Intermediate, Advanced)",
+                        "user_id": "AI_TUTOR"
+                    })
+                    continue
+                # print(f"🔄 State Synced. Current Topic ID: {state['current_topic_id']} | Completed: {len(state['topics_completed'])}")
+                
+                if not state.get("teacher_pack"):
+                     # Run in background to not block
+                     loop = asyncio.get_event_loop()
+                     pack = await loop.run_in_executor(None, fetch_teaching_pack, subject, chapter_for_pack)
+                     if pack:
+                         state["teacher_pack"] = pack
+
                 state["topic"] = user_message
                 # Infer level from grade (already provided in payload)
                 # Grade format: "Grade 10", "Grade 12", etc.
@@ -596,6 +1051,15 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
 
             if user_message.lower() in ["yes quiz", "start quiz", "quiz", "let's do quiz"] and state["quiz_permission"]:
                 history = "\n".join(chat_logs[room_id][-6:])
+                
+                # 🧠 Compute allowed topic IDs using the Gate
+                is_contextual = True # Default to contextual for immediate "quiz me" flow? 
+                # If they say "quiz", they usually mean "quiz me on what we just talked about".
+                # If they say "general quiz", maybe not. Let's assume contextual if current topic is set.
+                quiz_mode = "contextual" if state.get("current_topic_id") else "final" # Fallback to broad if no topic
+                
+                allowed_ids = get_allowed_topic_ids(state, quiz_mode)
+                
                 loop = asyncio.get_event_loop()
                 quiz_response = await loop.run_in_executor(
                     None,
@@ -607,7 +1071,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                         student_name=student_name,
                         grade_level=grade,
                         mode="quiz",
-                        current_topic=state["topic"]
+                        current_topic=state["topic"],
+                        # ✅ NEW: Use centralized Gate
+                        allowed_topic_ids=list(allowed_ids)
                     )
                 )
                 await websocket.send_json({"message": quiz_response, "user_id": "AI_TUTOR"})
@@ -641,9 +1107,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     for chapter in curriculum:
                         chapter_title = chapter.get("chapterTitle", "")
                         for topic in chapter.get("topics", []):
-                            if current_topic and topic.get("topicTitle", "") in current_topic:
+                            t_title = topic.get("topicTitle", "") if isinstance(topic, dict) else topic
+                            if current_topic and t_title in current_topic:
                                 chapter_to_quiz = chapter_title
-                                topics_for_quiz = [t.get("topicTitle", "") for t in chapter.get("topics", [])]
                                 break
                         if chapter_to_quiz:
                             break
@@ -651,10 +1117,38 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     # Still nothing? Use first chapter
                     if not chapter_to_quiz and len(curriculum) > 0:
                         chapter_to_quiz = curriculum[0].get("chapterTitle", subject)
-                        topics_for_quiz = [t.get("topicTitle", "") for t in curriculum[0].get("topics", [])]
                 
                 if not chapter_to_quiz:
                     chapter_to_quiz = subject
+
+                # 🚀 SCOPE CHECK for Final Quiz
+                # Verify all topics in this chapter are completed
+                chapter_obj = next((ch for ch in curriculum if ch.get("chapterTitle") == chapter_to_quiz), None)
+                all_chapter_topic_ids = []
+                topics_for_quiz = []
+                
+                if chapter_obj:
+                    for t in chapter_obj.get("topics", []):
+                        if isinstance(t, dict):
+                            all_chapter_topic_ids.append(t.get("topicId"))
+                            topics_for_quiz.append(t.get("topicTitle"))
+                        else:
+                            # Handling legacy format (string only) - assume no ID
+                            topics_for_quiz.append(t)
+                
+                completed_ids = state.get("topics_completed", set())
+                # Filter out None IDs if any
+                valid_ids = [tid for tid in all_chapter_topic_ids if tid]
+                
+                # Check completion (strict mode)
+                if valid_ids and not all(tid in completed_ids for tid in valid_ids):
+                    await websocket.send_json({
+                        "message": f"🚫 **Hold on!** You haven't finished all the topics in **{chapter_to_quiz}** yet.\n\nPlease complete all topics to unlock the Final Chapter Quiz!",
+                        "user_id": "AI_TUTOR"
+                    })
+                    continue
+
+                if not topics_for_quiz:
                     topics_for_quiz = [state.get("topic", "General")]
                 
                 # Initialize Quiz State
@@ -892,10 +1386,69 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
 
             # Regular tutoring flow
             history = "\n".join(chat_logs[room_id][-6:])
+
+            # Handle CHIP_CLICK (Structured Interaction)
+            if msg_type == "CHIP_CLICK":
+                # Use handle_chip_click from retrieve_and_respond
+                teacher_pack = state.get("teacher_pack", {})
+                
+                # Generate AI response based on chip intent
+                ai_response_text = handle_chip_click(payload, teacher_pack, state.get("topics_completed", set()))
+                
+                # Send immediate response
+                chat_logs[room_id].append(f"User (Chip): {payload.get('label')}")
+                chat_logs[room_id].append(f"AI: {ai_response_text}")
+                chat_logs[room_id] = chat_logs[room_id][-10:]
+                
+                await websocket.send_json({"message": ai_response_text, "user_id": "AI_TUTOR"})
+                
+                # Generate follow-up suggestions (New Chips)
+                try:
+                    loop = asyncio.get_event_loop()
+                    suggestions = await loop.run_in_executor(
+                        None,
+                        partial(
+                            generate_prompt_suggestions,
+                            question=payload.get("label", "Next step"), # Use label as context
+                            response=ai_response_text,
+                            subject=subject,
+                            student_name=student_name,
+                            grade_level=grade,
+                            history=history,
+                            teacher_pack=teacher_pack # ✅ Pass pack
+                        )
+                    )
+                    
+                    if suggestions and len(suggestions) > 0:
+                        await websocket.send_json({
+                            "message": "💡 Next:",
+                            "suggestions": suggestions,
+                            "type": "prompt_suggestions",
+                            "user_id": "AI_TUTOR"
+                        })
+                except Exception as e:
+                    print(f"⚠️ Error generating chip follow-ups: {e}")
+                
+                continue # Skip standard flow
             
             # Extract country and board from payload (default to Unknown if missing)
-            country = payload.get("country", "Unknown")
-            board = payload.get("board", payload.get("curriculum", "Unknown"))
+            # 1. Try payload
+            country = payload.get("country")
+            board = payload.get("board") or payload.get("curriculum")
+            
+            # 2. If present, update state
+            if country:
+                state["country"] = country
+            if board:
+                state["board"] = board
+                
+            # 3. If missing in payload, fallback to state
+            if not country:
+                country = state.get("country", "Unknown")
+            if not board:
+                board = state.get("board", "Unknown")
+
+            # Extract allowed subtopics from curriculum
             
             # Extract allowed subtopics from curriculum
             allowed_subtopics = []
@@ -912,6 +1465,14 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             active_topic_context = state.get("topic")
             if not active_topic_context:
                 active_topic_context = subject
+
+            # 🛠️ LESSON ENGINE HOOK (B6)
+            # Before calling generic answer_question, check if we are in a structured lesson
+            if state.get("lesson", {}).get("active", False):
+                 # Pass through to teacher-led runner
+                 # We assume `user_message` is the student's response to the previous prompt (teach acknowledgement, or check answer)
+                 await run_teacher_led_step(websocket, state, payload)
+                 continue
 
             loop = asyncio.get_event_loop()
             ai_response = await loop.run_in_executor(
@@ -976,7 +1537,10 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                             subject=subject,
                             student_name=student_name,
                             grade_level=grade,
-                            history=history
+                            student_name=student_name,
+                            grade_level=grade,
+                            history=history,
+                            teacher_pack=state.get("teacher_pack") # ✅ Pass pack
                         )
                     )
                     
@@ -1022,6 +1586,8 @@ async def upload_file_for_embedding(
     subject: str = Form(...),
     grade: Optional[str] = Form(None),
     curriculum: Optional[str] = Form(None),
+    board: Optional[str] = Form(None),
+    country: Optional[str] = Form(None),
     source: Optional[str] = Form(None)
 ):
     """
@@ -1099,6 +1665,10 @@ async def upload_file_for_embedding(
             metadata["grade"] = grade
         if curriculum:
             metadata["curriculum"] = curriculum
+        if board:
+            metadata["board"] = board
+        if country:
+            metadata["country"] = country
         
         # Handle different file types
         if file_extension == '.pdf':
@@ -1125,11 +1695,41 @@ async def upload_file_for_embedding(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error uploading file: {e}")
+        print(f"❌ Upload Error: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Error processing file: {str(e)}"
         )
+
+@app.post("/api/generate-teaching-pack")
+async def create_teaching_pack(
+    file: UploadFile = File(...)
+):
+    """
+    Generate a JSON Teaching Pack from an uploaded PDF.
+    """
+    try:
+        # Create uploads directory if it doesn't exist
+        os.makedirs("uploads", exist_ok=True)
+        
+        filename = f"temp_tp_{file.filename}"
+        save_path = f"uploads/{filename}"
+        
+        contents = await file.read()
+        with open(save_path, "wb") as f:
+            f.write(contents)
+            
+        print(f"🧠 Generating Teaching Pack for: {filename}...")
+        pack = generate_teaching_pack(save_path)
+        
+        # Cleanup temp file
+        # os.remove(save_path) 
+        
+        return {"status": "success", "teaching_pack": pack}
+        
+    except Exception as e:
+        print(f"❌ Generation Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 def embed_text_file(file_path: str, metadata: dict):
     """

@@ -1,10 +1,130 @@
 import os
 import numpy as np
+import hashlib
+import re
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_pinecone import PineconeVectorStore
+from langchain_community.chat_models import ChatOpenAI
 from langchain.prompts import PromptTemplate
+from langchain_community.vectorstores import Pinecone as PineconeVectorStore
+from langchain_openai import OpenAIEmbeddings
 import google.generativeai as genai
+
+# Helper imports for Chip Logic
+from typing import List, Dict, Any, Optional
+
+STOPWORDS = {
+    "the","a","an","and","or","to","of","in","on","for","with","is","are","was","were","be",
+    "this","that","it","as","by","from","at","into","about","can","could","would","should"
+}
+
+def _normalize(text: str) -> str:
+    return re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+
+def detect_turn_mode(response: str) -> str:
+    r = (response or "").strip().lower()
+    # If assistant asked a question recently, we want "answer suggestions"
+    if "?" in r and any(w in r for w in ["what", "why", "how", "which", "calculate", "define", "explain"]):
+        return "AI_ASKED_QUESTION"
+    if any(x in r for x in ["quiz", "mcq", "choose the correct", "options", "select"]):
+        return "QUIZ"
+    return "EXPLANATION"
+
+def detect_topic_id(teacher_pack: Dict[str, Any], text: str) -> Optional[str]:
+    text_l = _normalize(text)
+    words = {w for w in text_l.split() if len(w) >= 4 and w not in STOPWORDS}
+    best_id, best_score = None, 0
+
+    for t in teacher_pack.get("topics", []):
+        blob = " ".join([
+            t.get("title",""),
+            t.get("content",""),
+            " ".join(t.get("subtopics", []))
+        ])
+        blob_l = _normalize(blob)
+        blob_words = {w for w in blob_l.split() if len(w) >= 4 and w not in STOPWORDS}
+        score = len(words & blob_words)
+        if score > best_score:
+            best_score = score
+            best_id = t.get("id")
+
+    # require a tiny threshold so we don't match randomly
+    return best_id if best_score >= 2 else None
+
+def _topic_by_id(teacher_pack: Dict[str, Any], topic_id: str) -> Optional[Dict[str, Any]]:
+    for t in teacher_pack.get("topics", []):
+        if t.get("id") == topic_id:
+            return t
+    return None
+
+def _first_question_for_topic(teacher_pack: Dict[str, Any], topic_id: str) -> Optional[Dict[str, Any]]:
+    qb = teacher_pack.get("question_bank", {})
+    arr = qb.get(topic_id, [])
+    return arr[0] if arr else None
+
+def _fallback_practice_question(teacher_pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    qb = teacher_pack.get("question_bank", {})
+    for tid, arr in qb.items():
+        if arr:
+            q = arr[0]
+            return {**q, "_topic_id": tid}
+    return None
+
+def handle_chip_click(payload: dict, teacher_pack: dict, topics_completed: set = set()) -> str:
+    """
+    Handle a CHIP_CLICK event and return the appropriate AI response.
+    """
+    intent = payload.get("intent")
+    topic_id = payload.get("topic_id")
+    subtopic = payload.get("subtopic")
+    question_id = payload.get("question_id")
+
+    topic = _topic_by_id(teacher_pack, topic_id) if topic_id else None
+
+    if intent == "SIMPLIFY":
+        return f"Simple explanation: {topic.get('content','')}" if topic else "I can simplify it—tell me the exact part."
+
+    if intent == "GO_SUBTOPIC":
+        # you can prompt your LLM but constrain it to topic.content + subtopic label
+        return f"Let’s focus on **{subtopic}**.\n\n{topic.get('content','')}" if topic else f"Let’s discuss {subtopic}."
+
+    if intent == "SHOW_OBJECTIVES":
+        objs = teacher_pack.get("chapter_profile", {}).get("learning_objectives", [])
+        if not objs:
+            return "No objectives found for this chapter."
+        lines = [f"- {o.get('statement')}" for o in objs]
+        return "Here’s what you should master:\n" + "\n".join(lines)
+
+    if intent == "PRACTICE_MCQ":
+        # ✅ Scope Check
+        if topics_completed and topic_id and topic_id not in topics_completed:
+             # Make exception if it's the very first topic? Or just strictly block?
+             # User requested strict scoping.
+             return f"🔒 Please finish learning **{topic.get('title', 'this topic')}** before taking the quiz!"
+
+        qb = teacher_pack.get("question_bank", {}).get(topic_id, [])
+        q = None
+        if question_id:
+            q = next((x for x in qb if x.get("id") == question_id), None)
+        if not q and qb:
+            q = qb[0]
+        if not q:
+            return "I don’t have a practice question for this topic yet."
+        # Return question without revealing answer
+        choices = "\n".join([f"{idx+1}) {c}" for idx, c in enumerate(q.get("choices", []))])
+        return f"Practice MCQ:\n{q['prompt']}\n\n{choices}\n\nReply with 1/2/3/4."
+
+    if intent == "REAL_WORLD_EXAMPLE":
+        # If you want strict grounding, keep it simple:
+        return f"Real-world example for **{topic.get('title','this topic')}**:\nThink of how Earth pulls a dropped ball downward." if topic else "Example: dropping a ball—Earth pulls it down."
+
+    if intent in ("ASK_HINT", "ASK_SIMPLER"):
+        return "Sure — tell me which part confused you most (force, mass, distance, or equation)?"
+
+    if intent == "STUDENT_ANSWER":
+        # treat label as student's message
+        return payload.get("label", "Okay.")
+
+    return "Got it — what would you like to explore next?"
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -22,26 +142,75 @@ STATIC_IMAGE_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 if not os.path.exists(STATIC_IMAGE_DIR):
     os.makedirs(STATIC_IMAGE_DIR)
 
+# ============================================================================
+# C1) MASTERY JUDGE LOGIC
+# ============================================================================
+mastery_judge_prompt = PromptTemplate.from_template("""
+You are a strict teacher-grader.
+
+You will judge if the student understood the concept well enough to move on.
+
+Allowed Reference Material (ONLY):
+1) Teaching Pack snippet (authoritative):
+{teach_snippet}
+
+2) Textbook context:
+{context}
+
+Student answer:
+{student_answer}
+
+Return ONLY JSON:
+{{
+  "result": "PASS" or "FAIL",
+  "reason": "one sentence",
+  "fix": "one short correction in simple words",
+  "followup_question": "one short check question"
+}}
+""")
+
+def judge_mastery(student_answer: str, teach_snippet: str, context: str) -> dict:
+    try:
+        formatted = mastery_judge_prompt.format(
+            student_answer=student_answer,
+            teach_snippet=teach_snippet[:1500],
+            context=(context or "")[:1500],
+        )
+        model = genai.GenerativeModel("gemini-2.0-flash-exp")
+        resp = model.generate_content(formatted)
+        text = (resp.text or "").strip()
+        
+        # Clean markdown code blocks if present
+        text = text.replace("```json", "").replace("```", "").strip()
+        
+        import json
+        return json.loads(text)
+    except Exception as e:
+        print(f"⚠️ judge_mastery failed: {e}")
+        # safe fallback: pass if answer isn't empty and decent length
+        is_pass = "PASS" if len(student_answer.strip()) > 10 else "FAIL"
+        return {
+            "result": is_pass,
+            "reason": "Technical check skipped.",
+            "fix": "Please explain in 1-2 full sentences.",
+            "followup_question": "Can you restate the idea in your own words?"
+        }
+
 intro_prompt = PromptTemplate.from_template("""
 You are XRTutor, a super friendly and enthusiastic AI study buddy for XReality Education! 🌟 
 You are here to help {student_name}, a {grade_level} student, master **{subject}**.
 
 🔒 CRITICAL RULES (NON-NEGOTIABLE):
-1. You MUST answer ONLY using the provided textbook context below.
-2. If the answer is NOT in the context, say: "This topic is not covered in your current textbook."
-3. ALWAYS cite your source: "📖 Source: [Chapter/Topic Name]"
-4. Do NOT use outside knowledge.
+1) Use ONLY: (A) Teaching Pack snippet, (B) provided textbook context.
+2) If not found: respond exactly: "This topic is not covered in your current textbook. Would you like me to suggest related topics we can explore?"
+3) Cite: "📖 Source: [Chapter/Topic Name]"
+4) Do NOT use outside knowledge.
+5) Daily-life examples are allowed ONLY if explicitly supported by Teaching Pack or textbook context. Otherwise say you cannot provide an example not found in the textbook.
 
-Your Goal:
-- Be warm, encouraging, and fun!
-- Make the student feel comfortable and excited to learn.
+Teaching Pack snippet (authoritative):
+{teacher_pack_snippet}
 
-Start by introducing yourself nicely and asking:
-1. "What specific topic in {subject} do you want to conquer today?"
-2. "Are you in high school or college? (So I can explain it just right!)"
-3. "What's one thing you already know about this? (It's okay if the answer is 'nothing'!)"
-
-Context from books:
+Textbook Context:
 {context}
 
 Chat History:
@@ -49,11 +218,10 @@ Chat History:
 
 Student: {input}
 Answer:
-
-**Formatting Rule**:
-- ALWAYS use Unicode scientific notation for numbers (e.g., Use 6.67 × 10⁻¹¹ instead of 6.67 x 10^-11).
-- Use proper symbols for units (e.g., N·m²/kg² instead of N m^2/kg^2).
 """)
+
+
+
 
 tutoring_prompt = PromptTemplate.from_template("""
 You are XRTutor, an AI tutor for XReality Education helping {student_name} ({grade_level}) learn **{subject}**.
@@ -299,7 +467,7 @@ def generate_cached_image(topic: str, grade_level: str) -> str:
         print(f"❌ Image generation failed: {e}")
         return None
 
-def answer_question(question: str, history: str, subject: str, student_name: str, grade_level: str, country: str = "Unknown", board: str = "Unknown", mode: str = "tutoring", current_topic: str = "", allowed_subtopics: list = []) -> str:
+def answer_question(question: str, history: str, subject: str, student_name: str, grade_level: str, country: str = "Unknown", board: str = "Unknown", mode: str = "tutoring", current_topic: str = "", allowed_subtopics: list = [], allowed_topic_ids: list = [], teacher_pack_snippet: str = "") -> str:
     
     # 🚨 -1. SAFETY FIRST: Check for Crisis
     if detect_crisis_intent(question):
@@ -315,6 +483,10 @@ def answer_question(question: str, history: str, subject: str, student_name: str
         except Exception as e:
             print(f"❌ Error generating crisis response: {e}")
             return "I'm really sorry you're feeling this way. Please reach out to a trusted adult or emergency services immediately. You matter."
+
+    # 🚨 0. STRICT MODE: Check for Empty Allowed Topics (Dynamic Quiz)
+    if mode == "quiz" and isinstance(allowed_topic_ids, list) and len(allowed_topic_ids) == 0:
+        return "🔒 Let’s finish learning this topic first, then I’ll quiz you! 🙂"
 
     # 0. Check Relevance (Critical Step)
     if mode == "tutoring" and current_topic:
@@ -376,6 +548,12 @@ def answer_question(question: str, history: str, subject: str, student_name: str
             search_filter["country"] = country
             print(f"🌍 Filtering by country: {country}")
         
+        # ✅ Filter by Topic IDs (Scope Control)
+        if allowed_topic_ids and len(allowed_topic_ids) > 0:
+            # Assumes 'topic_id' is stored in metadata. If not, this might be strict.
+            search_filter["topic_id"] = {"$in": allowed_topic_ids}
+            print(f"🎯 Filtering by {len(allowed_topic_ids)} allowed topic IDs")
+        
         print(f"🔍 Search filter: {search_filter}")
         
         # Query Pinecone directly with enhanced filtering
@@ -397,6 +575,7 @@ def answer_question(question: str, history: str, subject: str, student_name: str
                     source_info = {
                         'chapter': match.metadata.get('chapter', 'Unknown Chapter'),
                         'topic': match.metadata.get('topic', ''),
+                        'topic_id': match.metadata.get('topic_id', None), # ✅ Capture topic_id
                         'page': match.metadata.get('page', ''),
                         'score': similarity_score
                     }
@@ -408,6 +587,16 @@ def answer_question(question: str, history: str, subject: str, student_name: str
                         'source': source_info
                     })
         
+        # ✋ Optional but Recommended Post-Filter Safety Net
+        if allowed_topic_ids:
+             original_count = len(relevant_docs)
+             relevant_docs = [
+                 d for d in relevant_docs 
+                 if d['source'].get('topic_id') in allowed_topic_ids
+             ]
+             if len(relevant_docs) < original_count:
+                 print(f"🔒 Post-filter removed {original_count - len(relevant_docs)} docs (topic_id mismatch or missing)")
+        
         if len(relevant_docs) > 0:
             relevant_context = "\n".join([doc['content'] for doc in relevant_docs])
             print(f"📖 Using context from {len(relevant_docs)} high-quality documents (Grade: {grade_level}, Board: {board})")
@@ -418,8 +607,8 @@ def answer_question(question: str, history: str, subject: str, student_name: str
                 f"I apologize, {student_name}, but I couldn't find information about this topic in your current {subject} textbook "
                 f"for {grade_level} ({board} curriculum). 📚\n\n"
                 f"Would you like me to:\n"
-                f"1. Suggest related topics we can explore?\n"
-                f"2. Help you with a different {subject} question?"
+                f"• Suggest related topics we can explore?\n"
+                f"• Help you with a different {subject} question?"
             )
             
     except Exception as e:
@@ -441,7 +630,8 @@ def answer_question(question: str, history: str, subject: str, student_name: str
         "subject": subject,
         "input": question,
         "history": history,
-        "context": relevant_context
+        "context": relevant_context,
+        "teacher_pack_snippet": teacher_pack_snippet  # ✅ NEW
     }
     
     # Special handling for quiz prompt which needs 'topic'
@@ -611,94 +801,108 @@ def get_user_chat_history(student_id: str, subject: str):
         print(f"⚠️ Error retrieving chat history: {e}")
         return []
 
-def generate_prompt_suggestions(question: str, response: str, subject: str, student_name: str, grade_level: str, history: str = "") -> list:
+def generate_prompt_suggestions(
+    question: str,
+    response: str,
+    subject: str,
+    student_name: str,
+    grade_level: str,
+    history: str = "",
+    teacher_pack: dict = None
+) -> list:
     """
-    Generate 3 contextual prompt suggestions based on the current conversation
+    Returns a list of chip objects:
+      { label, intent, topic_id?, subtopic?, question_id?, difficulty? }
+
+    Backwards-compat note:
+      If frontend still expects strings, you can map chips -> labels on the server.
     """
     try:
-        # Create a prompt for generating follow-up questions
-        suggestion_prompt = PromptTemplate.from_template("""
-You are an AI tutor helping {student_name}, a {grade_level} student learning {subject}.
+        teacher_pack = teacher_pack or {}
+        text = f"{question}\n{response}\n{history}"
+        mode = detect_turn_mode(response)
 
-Based on the student's question: "{question}"
-And your response: "{response}"
+        # pick topic
+        topic_id = detect_topic_id(teacher_pack, text)
+        if not topic_id:
+            # fallback to a reasonable default if pack contains it
+            topic_id = teacher_pack.get("topics", [{}])[0].get("id") if teacher_pack.get("topics") else None
 
-Generate exactly 3 follow-up questions or prompts that would help the student:
-1. Deepen their understanding of the current topic
-2. Explore related concepts
-3. Apply what they've learned
+        topic = _topic_by_id(teacher_pack, topic_id) if topic_id else None
 
-Make the suggestions:
-- Specific and actionable
-- Appropriate for {grade_level} level
-- Related to {subject}
-- Encouraging and engaging
-- 10-15 words each maximum
+        chips: List[Dict[str, Any]] = []
 
-Format as a simple list, one per line, no numbering or bullets.
+        def add(label: str, intent: str, **payload):
+            chips.append({
+                "label": label[:90],  # keep short for UI
+                "intent": intent,
+                **payload
+            })
 
-Examples of good suggestions:
-- "Can you explain this with a real-world example?"
-- "What happens if we change this variable?"
-- "How does this relate to what we learned earlier?"
-- "Can you give me a practice problem?"
-- "What are the common mistakes students make here?"
+        # -------------------------
+        # MODE: AI asked a question -> show "possible student responses"
+        # -------------------------
+        if mode == "AI_ASKED_QUESTION":
+            # Use topic content to create safe grounded answer suggestions
+            content = (topic.get("content") if topic else "") or ""
+            first_sentence = content.split(".")[0].strip()
+            if not first_sentence:
+                first_sentence = "Gravity pulls objects toward a massive body like Earth."
 
-Suggestions:
-""")
+            add(first_sentence, "STUDENT_ANSWER", topic_id=topic_id)
+            add("I’m not sure — explain it in simpler words.", "ASK_SIMPLER", topic_id=topic_id)
+            add("Can you give me a hint?", "ASK_HINT", topic_id=topic_id)
 
-        llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY, temperature=0.7)
-        chain = suggestion_prompt.partial(
-            student_name=student_name,
-            grade_level=grade_level,
-            subject=subject
-        ) | llm
+            # If subtopics exist, offer one “guide” chip
+            if topic and topic.get("subtopics"):
+                add(f"Start with: {topic['subtopics'][0]}", "GO_SUBTOPIC", topic_id=topic_id, subtopic=topic["subtopics"][0])
 
-        result = chain.invoke({
-            "question": question,
-            "response": response
-        })
+            return chips[:5]
 
-        raw_suggestions = str(result.content if hasattr(result, "content") else result)
-        
-        # Parse the suggestions
-        suggestions = []
-        for line in raw_suggestions.split('\\n'):
-            line = line.strip()
-            if line and not line.startswith(('Suggestions:', 'Examples:', 'Format')):
-                # Remove any numbering or bullets
-                line = line.lstrip('123456789.-•* ')
-                if len(line) > 5 and len(line) < 100:  # Reasonable length
-                    suggestions.append(line)
-        
-        # Ensure we have exactly 3 suggestions
-        if len(suggestions) >= 3:
-            return suggestions[:3]
-        elif len(suggestions) > 0:
-            # Fill with fallback suggestions if needed
-            fallbacks = [
-                "Can you explain this concept with an example?",
-                "How does this apply to real life?",
-                f"What should I study next in {subject}?"
-            ]
-            while len(suggestions) < 3:
-                suggestions.append(fallbacks[len(suggestions) % len(fallbacks)])
-            return suggestions[:3]
+        # -------------------------
+        # MODE: Quiz -> actions around answering/checking
+        # -------------------------
+        if mode == "QUIZ":
+            q = _first_question_for_topic(teacher_pack, topic_id) if topic_id else None
+            if q and q.get("type") == "mcq":
+                # Provide helper actions (not answers)
+                add("I want a hint (not the answer).", "ASK_HINT", topic_id=topic_id, question_id=q.get("id"))
+                add("Explain why the correct option is correct.", "EXPLAIN_ANSWER", topic_id=topic_id, question_id=q.get("id"))
+                add("Give me a similar practice MCQ.", "PRACTICE_MCQ", topic_id=topic_id, difficulty=q.get("difficulty", "easy"))
+                return chips[:5]
+
+        # -------------------------
+        # MODE: Explanation -> deepen, simplify, practice, next subtopic
+        # -------------------------
+        add("Explain it in simpler words.", "SIMPLIFY", topic_id=topic_id)
+
+        if topic and topic.get("subtopics"):
+            add(f"Explain: {topic['subtopics'][0]}", "GO_SUBTOPIC", topic_id=topic_id, subtopic=topic["subtopics"][0])
+
+        add("Give a real-world example.", "REAL_WORLD_EXAMPLE", topic_id=topic_id)
+
+        # Practice (grounded in question_bank)
+        q = _first_question_for_topic(teacher_pack, topic_id) if topic_id else None
+        if q:
+            add("Give me a practice MCQ.", "PRACTICE_MCQ", topic_id=topic_id, question_id=q.get("id"), difficulty=q.get("difficulty"))
         else:
-            # Fallback suggestions if AI generation fails
-            return [
-                "Can you explain this with a real-world example?",
-                f"How does this relate to other {subject} concepts?",
-                "Can you give me a practice problem on this topic?"
-            ]
+            fq = _fallback_practice_question(teacher_pack)
+            if fq:
+                add("Give me a practice MCQ.", "PRACTICE_MCQ", topic_id=fq["_topic_id"], question_id=fq.get("id"), difficulty=fq.get("difficulty"))
+
+        # Objectives (nice “guide”)
+        if teacher_pack.get("chapter_profile", {}).get("learning_objectives"):
+            add("What should I master in this chapter?", "SHOW_OBJECTIVES")
+
+        return chips[:5]
 
     except Exception as e:
         print(f"⚠️ Error generating prompt suggestions: {e}")
-        # Return fallback suggestions
+        # safe fallback (still structured)
         return [
-            "Can you explain this with an example?",
-            "How does this work in practice?",
-            f"What should I study next in {subject}?"
+            {"label": "Explain with a real-world example.", "intent": "REAL_WORLD_EXAMPLE"},
+            {"label": f"How does this relate to other {subject} concepts?", "intent": "RELATED_CONCEPT"},
+            {"label": "Give me a practice question.", "intent": "PRACTICE_GENERIC"}
         ]
 
 def check_question_similarity(new_question: str, previous_questions: list, similarity_threshold: float = 0.85) -> tuple:
@@ -764,10 +968,19 @@ def check_question_similarity(new_question: str, previous_questions: list, simil
         
         return similar_count > 0, similar_count, most_similar_question
 
+def normalize_question(q: str) -> str:
+    q = q.strip().lower()
+    q = re.sub(r"\s+", " ", q)
+    q = re.sub(r"[^\w\s\?\.\-]", "", q)  # keep words/basic punctuation
+    return q
+
+def cache_id(scope: dict, normalized_q: str) -> str:
+    key = f"{scope.get('grade')}|{scope.get('board')}|{scope.get('country')}|{normalized_q}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
 def check_response_cache(question: str, country: str, board: str, grade: str, subject: str) -> str:
     """
-    Check if a similar question has been answered before for same country/board/grade.
-    Returns cached response if similarity >= 0.92, else None.
+    Check if a similar question has been answered sufficient times (>=10).
     """
     try:
         from pinecone import Pinecone
@@ -775,28 +988,44 @@ def check_response_cache(question: str, country: str, board: str, grade: str, su
         index = pc.Index(PINECONE_INDEX_NAME)
 
         embedding = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-        question_embedding = embedding.embed_query(question)
+        # Normalize and scope
+        nq = normalize_question(question)
+        question_embedding = embedding.embed_query(nq)
+        
+        # Scope filters
+        scope = {
+            "country": country,
+            "board": board,
+            "grade": grade,
+        }
 
-        # Query Pinecone for cached responses
+        specific_filters = {
+            "type": "response_cache",
+            "country": country,
+            "board": board,
+            "grade": grade,
+            "subject": subject.lower()
+        }
+
         query_response = index.query(
             vector=question_embedding,
             top_k=1,
             include_metadata=True,
-            filter={
-                "type": "response_cache",
-                "country": country,
-                "board": board,
-                "grade": grade,
-                "subject": subject.lower()
-            }
+            filter=specific_filters
         )
 
-        if query_response.matches:
-            match = query_response.matches[0]
-            if match.score >= 0.92:
-                print(f"✅ Found cached response (Score: {match.score:.4f})")
-                return match.metadata.get('response_text')
-            
+        if not query_response.matches:
+            return None
+
+        match = query_response.matches[0]
+        md = match.metadata or {}
+        freq = int(md.get("frequency_count", 0))
+
+        # Only return if similarity is high enough AND it's a frequent question
+        if match.score >= 0.95 and freq >= 10:
+            print(f"✅ Found TRUSTED cached response (Score: {match.score:.4f}, Freq: {freq})")
+            return md.get('response_text')
+        
     except Exception as e:
         print(f"⚠️ Cache check failed: {e}")
     
@@ -804,13 +1033,12 @@ def check_response_cache(question: str, country: str, board: str, grade: str, su
 
 def cache_response(question: str, response: str, country: str, board: str, grade: str, subject: str):
     """
-    Store question-response pair in Pinecone with metadata for future reuse.
+    Store or update question-response pair with frequency counting.
     """
     try:
         if not response or len(response) < 10:
             return  # Don't cache empty or too short responses
 
-        import uuid
         from datetime import datetime
         from pinecone import Pinecone
         
@@ -818,10 +1046,59 @@ def cache_response(question: str, response: str, country: str, board: str, grade
         index = pc.Index(PINECONE_INDEX_NAME)
 
         embedding = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-        question_embedding = embedding.embed_query(question)
+        
+        # Normalize
+        nq = normalize_question(question)
+        question_embedding = embedding.embed_query(nq)
+        
+        scope = {
+            "grade": grade,
+            "board": board,
+            "country": country
+        }
 
+        # 1. Logic: First check if we have a near-duplicate to update
+        specific_filters = {
+            "type": "response_cache",
+            "country": country,
+            "board": board,
+            "grade": grade,
+            "subject": subject.lower()
+        }
+        
+        # Check current cache
+        res = index.query(
+            vector=question_embedding,
+            top_k=1,
+            include_metadata=True,
+            filter=specific_filters
+        )
+        
+        match = (res.get("matches") or [None])[0]
+        ts = datetime.utcnow().isoformat()
+        
+        # 2. If near-duplicate exists (Score > 0.95), increment
+        if match and match.get("score", 0) >= 0.95:
+            mid = match["id"]
+            md = match.get("metadata") or {}
+            freq = int(md.get("frequency_count", 1))
+            
+            # Simple atomic-ish update (Pinecone update merges metadata)
+            index.update(
+                id=mid,
+                set_metadata={
+                    "frequency_count": freq + 1,
+                    "last_seen_at": ts
+                }
+            )
+            print(f"💾 Updated cache frequency: {freq + 1} for ID: {mid}")
+            return
+
+        # 3. Else Create New Entry with Deterministic ID
+        cid = cache_id(scope, nq)
+        
         vector = {
-            "id": f"cache_{str(uuid.uuid4())}",
+            "id": f"cache_{cid}",
             "values": question_embedding,
             "metadata": {
                 "type": "response_cache",
@@ -830,13 +1107,16 @@ def cache_response(question: str, response: str, country: str, board: str, grade
                 "grade": grade,
                 "subject": subject.lower(),
                 "question_text": question,
+                "normalized_question": nq,
                 "response_text": response,
-                "timestamp": datetime.utcnow().isoformat()
+                "frequency_count": 1, 
+                "first_seen_at": ts,
+                "last_seen_at": ts
             }
         }
 
         index.upsert(vectors=[vector])
-        print("💾 Response cached for future use")
+        print(f"💾 New response cached for future use (count: 1) ID: {cid}")
 
     except Exception as e:
         print(f"⚠️ Failed to cache response: {e}")
